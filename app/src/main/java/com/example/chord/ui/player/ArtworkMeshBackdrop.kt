@@ -1,134 +1,245 @@
 package com.example.chord.ui.player
 
+import android.graphics.Bitmap
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.draw.blur
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.core.graphics.drawable.toBitmap
+import coil.imageLoader
+import coil.request.ImageRequest
+import coil.request.SuccessResult
+import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlin.math.floor
+import kotlin.math.roundToInt
+import kotlin.random.Random
 
-internal enum class PlayerIcon {
-    Back, More, Heart, Previous, Play, Pause, Next, Lyrics, Headphones, Queue, Volume, VolumeLow
-}
+private const val GRID_SIZE = 6
+private const val TEXTURE_SIZE = 32
+private const val SOURCE_SIZE = 120
 
+private val fallbackColor = Color(0xFF111114)
+
+/**
+ * Reusable artwork-derived background inspired by BitChord's mesh backdrop.
+ *
+ * It samples the cover into a small colour grid, flips the grid so its first
+ * row represents the cover's bottom edge, and smooths it into a tiny texture.
+ * The original artwork remains a separate, sharp foreground image.
+ *
+ * [seam] is the vertical position of the artwork's bottom edge in this
+ * composable's coordinate space. Keep it at 0.dp when there is no cover above
+ * this background.
+ */
 @Composable
-internal fun PlayerGlyph(
-    icon: PlayerIcon,
-    modifier: Modifier = Modifier.size(24.dp),
-    alpha: Float = 1f,
+fun ArtworkMeshBackdrop(
+    artworkUrl: String?,
+    modifier: Modifier = Modifier,
+    seam: Dp = 0.dp,
+    blurRadius: Dp = 18.dp,
+    darken: Boolean = true,
 ) {
-    Canvas(modifier) {
-        val w = size.width
-        val h = size.height
-        val c = Color.White.copy(alpha = alpha)
-        val stroke = Stroke(
-            width = (size.minDimension * 0.085f).coerceAtLeast(1.5f),
-            cap = StrokeCap.Round,
-            join = StrokeJoin.Round
-        )
+    val context = LocalContext.current
+    var mesh by remember(artworkUrl) { mutableStateOf<ImageBitmap?>(null) }
 
-        when (icon) {
-            PlayerIcon.Back -> {
-                val p = Path().apply {
-                    moveTo(w * .7f, h * .25f)
-                    lineTo(w * .3f, h * .5f)
-                    lineTo(w * .7f, h * .75f)
-                }
-                drawPath(p, c, style = stroke)
+    LaunchedEffect(artworkUrl) {
+        mesh = null
+        val url = artworkUrl?.takeIf(String::isNotBlank) ?: return@LaunchedEffect
+        val decoded = withContext(Dispatchers.IO) {
+            runCatching {
+                val request = ImageRequest.Builder(context)
+                    .data(url)
+                    .size(SOURCE_SIZE, SOURCE_SIZE)
+                    .allowHardware(false)
+                    .build()
+                val result = context.imageLoader.execute(request)
+                val drawable = (result as? SuccessResult)?.drawable ?: return@runCatching null
+                drawable.toBitmap(SOURCE_SIZE, SOURCE_SIZE).asImageBitmap()
+            }.getOrNull()
+        } ?: return@LaunchedEffect
+
+        mesh = withContext(Dispatchers.Default) { buildMesh(decoded) }
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(fallbackColor)
+    ) {
+        Canvas(
+            Modifier
+                .fillMaxSize()
+                .then(if (blurRadius > 0.dp) Modifier.blur(blurRadius) else Modifier)
+        ) {
+            val current = mesh
+            if (current != null) {
+                drawAnchoredMesh(current, seam.toPx())
             }
-            PlayerIcon.More -> listOf(.2f, .5f, .8f).forEach {
-                drawCircle(c, w * .07f, Offset(w * it, h * .5f))
-            }
-            PlayerIcon.Heart -> {
-                val p = Path().apply {
-                    moveTo(w * .5f, h * .85f)
-                    cubicTo(w * .38f, h * .72f, w * .08f, h * .48f, w * .12f, h * .29f)
-                    cubicTo(w * .16f, h * .06f, w * .40f, h * .10f, w * .5f, h * .28f)
-                    cubicTo(w * .60f, h * .10f, w * .84f, h * .06f, w * .88f, h * .29f)
-                    cubicTo(w * .92f, h * .48f, w * .62f, h * .72f, w * .5f, h * .85f)
-                    close()
-                }
-                drawPath(p, c, style = stroke)
-            }
-            PlayerIcon.Previous, PlayerIcon.Next -> {
-                val reverse = icon == PlayerIcon.Previous
-                for (i in 0..1) {
-                    val x = if (reverse) .72f - i * .34f else .28f + i * .34f
-                    val p = Path().apply {
-                        if (reverse) {
-                            moveTo(w * x, h * .15f)
-                            lineTo(w * (x - .25f), h * .5f)
-                            lineTo(w * x, h * .85f)
-                        } else {
-                            moveTo(w * x, h * .15f)
-                            lineTo(w * (x + .25f), h * .5f)
-                            lineTo(w * x, h * .85f)
-                        }
-                        close()
-                    }
-                    drawPath(p, c)
-                }
-            }
-            PlayerIcon.Play -> {
-                val p = Path().apply {
-                    moveTo(w * .22f, h * .10f)
-                    lineTo(w * .86f, h * .5f)
-                    lineTo(w * .22f, h * .90f)
-                    close()
-                }
-                drawPath(p, c)
-            }
-            PlayerIcon.Pause -> {
-                drawRoundRect(c, Offset(w * .24f, h * .15f), Size(w * .17f, h * .7f), CornerRadius(w * .04f))
-                drawRoundRect(c, Offset(w * .59f, h * .15f), Size(w * .17f, h * .7f), CornerRadius(w * .04f))
-            }
-            PlayerIcon.Lyrics -> {
-                drawRoundRect(c, Offset(w * .12f, h * .12f), Size(w * .76f, h * .68f), CornerRadius(w * .12f), style = stroke)
-                drawLine(c, Offset(w * .30f, h * .34f), Offset(w * .70f, h * .34f), stroke.width, StrokeCap.Round)
-                drawLine(c, Offset(w * .30f, h * .52f), Offset(w * .62f, h * .52f), stroke.width, StrokeCap.Round)
-            }
-            PlayerIcon.Headphones -> {
-                drawArc(c, 180f, 180f, false, Offset(w * .15f, h * .12f), Size(w * .7f, h * .72f), style = stroke)
-                drawRoundRect(c, Offset(w * .12f, h * .48f), Size(w * .20f, h * .36f), CornerRadius(w * .06f))
-                drawRoundRect(c, Offset(w * .68f, h * .48f), Size(w * .20f, h * .36f), CornerRadius(w * .06f))
-            }
-            PlayerIcon.Queue -> {
-                for (i in 0..2) {
-                    val y = h * (.25f + i * .25f)
-                    drawCircle(c, w * .055f, Offset(w * .13f, y))
-                    drawLine(c, Offset(w * .29f, y), Offset(w * .88f, y), stroke.width, StrokeCap.Round)
-                }
-            }
-            PlayerIcon.VolumeLow, PlayerIcon.Volume -> {
-                val p = Path().apply {
-                    moveTo(w * .10f, h * .40f)
-                    lineTo(w * .31f, h * .40f)
-                    lineTo(w * .53f, h * .20f)
-                    lineTo(w * .53f, h * .80f)
-                    lineTo(w * .31f, h * .60f)
-                    lineTo(w * .10f, h * .60f)
-                    close()
-                }
-                drawPath(p, c)
-                if (icon == PlayerIcon.Volume) {
-                    drawArc(c, -48f, 96f, false, Offset(w * .35f, h * .29f), Size(w * .48f, h * .42f), style = stroke)
-                    drawArc(c, -48f, 96f, false, Offset(w * .25f, h * .14f), Size(w * .70f, h * .72f), style = stroke)
-                } else {
-                    drawArc(c, -48f, 96f, false, Offset(w * .35f, h * .29f), Size(w * .48f, h * .42f), style = stroke)
-                }
+        }
+
+        if (darken) {
+            Canvas(Modifier.fillMaxSize()) {
+                drawRect(
+                    Brush.verticalGradient(
+                        0f to Color.Black.copy(alpha = 0.06f),
+                        0.52f to Color.Black.copy(alpha = 0.24f),
+                        1f to Color.Black.copy(alpha = 0.48f)
+                    )
+                )
             }
         }
     }
 }
 
-internal fun formatPlayerTime(milliseconds: Long): String {
-    val seconds = milliseconds.coerceAtLeast(0L) / 1000L
-    return "%d:%02d".format(seconds / 60L, seconds % 60L)
+private fun DrawScope.drawAnchoredMesh(image: ImageBitmap, seamY: Float) {
+    val width = size.width.roundToInt().coerceAtLeast(1)
+    val height = size.height.roundToInt().coerceAtLeast(1)
+    val seam = seamY.roundToInt().coerceIn(0, height)
+
+    if (seam > 0) {
+        drawImage(
+            image = image,
+            srcOffset = IntOffset(0, 0),
+            srcSize = IntSize(image.width, 1),
+            dstOffset = IntOffset(0, 0),
+            dstSize = IntSize(width, seam),
+            filterQuality = FilterQuality.Medium
+        )
+    }
+    if (seam < height) {
+        drawImage(
+            image = image,
+            srcOffset = IntOffset(0, 0),
+            srcSize = IntSize(image.width, image.height),
+            dstOffset = IntOffset(0, seam),
+            dstSize = IntSize(width, height - seam),
+            filterQuality = FilterQuality.Medium
+        )
+    }
+}
+
+private fun buildMesh(source: ImageBitmap): ImageBitmap {
+    val width = source.width.coerceAtLeast(1)
+    val height = source.height.coerceAtLeast(1)
+    val pixels = IntArray(width * height)
+    source.readPixels(pixels, 0, 0, width, height)
+
+    val grid = IntArray(GRID_SIZE * GRID_SIZE)
+    for (gy in 0 until GRID_SIZE) {
+        for (gx in 0 until GRID_SIZE) {
+            val left = gx * width / GRID_SIZE
+            val right = ((gx + 1) * width / GRID_SIZE).coerceAtLeast(left + 1).coerceAtMost(width)
+            val top = gy * height / GRID_SIZE
+            val bottom = ((gy + 1) * height / GRID_SIZE).coerceAtLeast(top + 1).coerceAtMost(height)
+            var red = 0L
+            var green = 0L
+            var blue = 0L
+            var count = 0L
+
+            for (y in top until bottom) {
+                for (x in left until right) {
+                    val pixel = pixels[y * width + x]
+                    red += (pixel ushr 16) and 0xFF
+                    green += (pixel ushr 8) and 0xFF
+                    blue += pixel and 0xFF
+                    count++
+                }
+            }
+
+            grid[gy * GRID_SIZE + gx] = android.graphics.Color.rgb(
+                (red / count.coerceAtLeast(1)).toInt(),
+                (green / count.coerceAtLeast(1)).toInt(),
+                (blue / count.coerceAtLeast(1)).toInt()
+            )
+        }
+    }
+
+    // Put the source artwork's bottom edge at row zero.
+    val flipped = IntArray(grid.size)
+    for (y in 0 until GRID_SIZE) {
+        for (x in 0 until GRID_SIZE) {
+            flipped[y * GRID_SIZE + x] = grid[(GRID_SIZE - 1 - y) * GRID_SIZE + x]
+        }
+    }
+
+    // Keep the seam row untouched; shift the rows below it to avoid a mirror effect.
+    val transformed = flipped.copyOf()
+    val random = Random(width * 31 + height)
+    val shift = random.nextInt(GRID_SIZE)
+    val mirror = random.nextBoolean()
+    for (y in 1 until GRID_SIZE) {
+        for (x in 0 until GRID_SIZE) {
+            val sourceX = if (mirror) GRID_SIZE - 1 - x else x
+            transformed[y * GRID_SIZE + x] =
+                flipped[y * GRID_SIZE + (sourceX + shift) % GRID_SIZE]
+        }
+    }
+
+    val texture = IntArray(TEXTURE_SIZE * TEXTURE_SIZE)
+    for (y in 0 until TEXTURE_SIZE) {
+        val fy = (y + 0.5f) / TEXTURE_SIZE * GRID_SIZE - 0.5f
+        val y0 = floor(fy).toInt().coerceIn(0, GRID_SIZE - 1)
+        val y1 = (y0 + 1).coerceAtMost(GRID_SIZE - 1)
+        val wy = smoothStep(fy - y0)
+
+        for (x in 0 until TEXTURE_SIZE) {
+            val fx = (x + 0.5f) / TEXTURE_SIZE * GRID_SIZE - 0.5f
+            val x0 = floor(fx).toInt().coerceIn(0, GRID_SIZE - 1)
+            val x1 = (x0 + 1).coerceAtMost(GRID_SIZE - 1)
+            val wx = smoothStep(fx - x0)
+            val top = mixArgb(
+                transformed[y0 * GRID_SIZE + x0],
+                transformed[y0 * GRID_SIZE + x1],
+                wx
+            )
+            val bottom = mixArgb(
+                transformed[y1 * GRID_SIZE + x0],
+                transformed[y1 * GRID_SIZE + x1],
+                wx
+            )
+            texture[y * TEXTURE_SIZE + x] = mixArgb(top, bottom, wy)
+        }
+    }
+
+    return Bitmap.createBitmap(
+        texture,
+        TEXTURE_SIZE,
+        TEXTURE_SIZE,
+        Bitmap.Config.ARGB_8888
+    ).asImageBitmap()
+}
+
+private fun smoothStep(value: Float): Float {
+    val t = value.coerceIn(0f, 1f)
+    return t * t * (3f - 2f * t)
+}
+
+private fun mixArgb(from: Int, to: Int, fraction: Float): Int {
+    val t = fraction.coerceIn(0f, 1f)
+    fun channel(shift: Int): Int {
+        val a = (from ushr shift) and 0xFF
+        val b = (to ushr shift) and 0xFF
+        return (a + (b - a) * t).roundToInt().coerceIn(0, 255)
+    }
+    return android.graphics.Color.rgb(channel(16), channel(8), channel(0))
 }
