@@ -3,6 +3,7 @@ package com.example.chord.di
 import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import com.example.chord.data.library.LibraryStore
 import com.example.chord.data.repository.MusicRepository
 import com.example.chord.playback.PlaybackController
 import com.example.chord.ui.player.PlayerViewModel
@@ -15,12 +16,12 @@ class AppContainer(context: Context) {
 
     fun searchViewModelFactory(): ViewModelProvider.Factory =
         factory {
-            SearchViewModel(musicRepository)
+            SearchViewModel(musicRepository, appContext)
         }
 
     fun playerViewModelFactory(): ViewModelProvider.Factory =
         factory {
-            PlayerViewModel(PlaybackController(appContext))
+            PlayerViewModel(PlaybackController(appContext), LibraryStore.get(appContext))
         }
 
     private inline fun <reified T : ViewModel> factory(

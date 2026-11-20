@@ -2,6 +2,10 @@ package com.example.chord.playback
 
 import android.content.Context
 import android.util.Log
+import com.example.chord.data.history.HistoryStore
+import com.example.chord.data.model.Song
+import com.example.chord.playback.addon.AddonResolver
+import com.example.chord.playback.addon.MonochromeResolver
 import com.metrolist.innertubex.InnerTube
 import com.metrolist.innertubex.cipher.PlayerConfigRepository
 import com.metrolist.innertubex.cipher.RemotePlayerConfigStore
@@ -22,12 +26,37 @@ import kotlinx.serialization.json.Json
 
 data class AudioStream(
     val url: String,
-    val headers: Map<String, String>
+    val headers: Map<String, String>,
+    /** "Opus · 160 kbps · 48 kHz". Empty if unknown. */
+    val quality: String = "",
+    val mimeType: String? = null,
+    val contentLength: Long? = null,
+    val chunkSize: Long = 0L,
 )
 
 class AudioStreamExtractor(context: Context) {
 
     private val appContext = context.applicationContext
+
+    /**
+     * Resolve a download using the same source priority as playback:
+     * Monochrome FLAC -> download-enabled addons -> YouTube fallback.
+     * Passing the complete Song is important: a video ID alone cannot be matched
+     * against Monochrome's catalogue.
+     */
+    suspend fun extract(song: Song, forDownload: Boolean = true): AudioStream =
+        withContext(Dispatchers.IO) {
+            if (song.videoId.startsWith("local:")) error("Local tracks do not need stream extraction.")
+
+            val monochrome = runCatching { MonochromeResolver.resolve(song) }.getOrNull()
+            if (monochrome != null) return@withContext monochrome
+
+            val artist = HistoryStore.cleanArtist(song.details)
+            val addon = AddonResolver.resolve(song.videoId, song.title, artist, forDownload)
+            if (addon != null) return@withContext addon
+
+            extract(song.videoId)
+        }
 
     suspend fun extract(videoId: String): AudioStream =
         withContext(Dispatchers.IO) {
@@ -77,9 +106,16 @@ class AudioStreamExtractor(context: Context) {
                     "YouTube returned an empty audio URL."
                 }
 
+                val quality = StreamInfoStore.label(stream.codecs, stream.mimeType, stream.bitrate, stream.sampleRate)
+                StreamInfoStore.put(videoId, quality)
+
                 AudioStream(
                     url = stream.audioUrl,
-                    headers = stream.headers
+                    headers = stream.headers,
+                    quality = quality,
+                    mimeType = stream.mimeType,
+                    contentLength = stream.contentLengthBytes,
+                    chunkSize = stream.rangeChunkSizeBytes,
                 )
             } finally {
                 innerTube.close()

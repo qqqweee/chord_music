@@ -19,7 +19,8 @@ data class RadioPage(
     val continuation: String?
 )
 
-class MusicRepository {
+/** Pass a Context to get signed-in, taste-aware radio ([SmartRadio]). No Context = plain radio. */
+class MusicRepository(private val ctx: android.content.Context? = null) {
 
     private fun createHttpClient() = HttpClient(OkHttp) {
         install(ContentNegotiation) {
@@ -64,7 +65,20 @@ class MusicRepository {
 
     suspend fun getRadioPage(
         seedVideoId: String,
-        continuation: String? = null
+        continuation: String? = null,
+        blend: Boolean = true,
+    ): RadioPage {
+        require(seedVideoId.isNotBlank()) { "A seed video ID is required." }
+        ctx?.let { c ->
+            val smart = runCatching { SmartRadio.page(c.applicationContext, seedVideoId, continuation, blend) }.getOrNull()
+            if (smart != null && smart.songs.isNotEmpty()) return smart
+        }
+        return plainRadioPage(seedVideoId, continuation)
+    }
+
+    private suspend fun plainRadioPage(
+        seedVideoId: String,
+        continuation: String?
     ): RadioPage = withContext(Dispatchers.IO) {
         require(seedVideoId.isNotBlank()) {
             "A seed video ID is required."
@@ -124,7 +138,23 @@ class MusicRepository {
                             videoId.isNotBlank() &&
                             songs.none { it.videoId == videoId }
                         ) {
-                            songs += Song(title, details, videoId)
+                            val thumbnailUrl = (
+                                    renderer["thumbnail"] as? JsonObject
+                                    )?.get("thumbnails")
+                                ?.jsonArray
+                                ?.lastOrNull()
+                                ?.jsonObject
+                                ?.get("url")
+                                ?.jsonPrimitive
+                                ?.contentOrNull
+
+                            com.example.chord.data.explicit.ExplicitStore.mark(videoId, renderer)
+                            songs += Song(
+                                title = title,
+                                details = details,
+                                videoId = videoId,
+                                thumbnailUrl = thumbnailUrl
+                            )
                         }
                     }
 
@@ -151,23 +181,37 @@ class MusicRepository {
 
                     if (renderer != null) {
                         val videoId = renderer["videoId"]
-                            ?.jsonPrimitive?.contentOrNull
+                            ?.jsonPrimitive
+                            ?.contentOrNull
 
                         val title = renderer["title"].readText()
+
                         val artist = renderer["longBylineText"].readText()
                             .ifBlank {
                                 renderer["shortBylineText"].readText()
                             }
+
+                        val thumbnailUrl = (
+                                renderer["thumbnail"] as? JsonObject
+                                )?.get("thumbnails")
+                            ?.jsonArray
+                            ?.lastOrNull()
+                            ?.jsonObject
+                            ?.get("url")
+                            ?.jsonPrimitive
+                            ?.contentOrNull
 
                         if (
                             !videoId.isNullOrBlank() &&
                             title.isNotBlank() &&
                             songs.none { it.videoId == videoId }
                         ) {
+                            com.example.chord.data.explicit.ExplicitStore.mark(videoId, renderer)
                             songs += Song(
                                 title = title,
                                 details = artist,
-                                videoId = videoId
+                                videoId = videoId,
+                                thumbnailUrl = thumbnailUrl
                             )
                         }
                     }

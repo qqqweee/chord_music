@@ -26,6 +26,8 @@ android {
 
     buildTypes {
         release {
+            // Debug-signed so the release APK installs on your phone. Swap for your own key before Play Store.
+            signingConfig = signingConfigs.getByName("debug")
             optimization {
                 enable = true
                 packageScope = setOf(
@@ -49,17 +51,17 @@ android {
 
 dependencies {
     implementation(platform(libs.androidx.compose.bom))
-    val composeBom = platform("androidx.compose:compose-bom:2024.09.03")
-    implementation(composeBom)
     // Compose
     implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.compose.foundation)
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation("androidx.compose.runtime:runtime")
     implementation("androidx.compose.foundation:foundation")
-
+    implementation("androidx.compose.material:material-icons-extended")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose")
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
 
@@ -78,8 +80,11 @@ dependencies {
     implementation("androidx.media3:media3-datasource:1.11.1")
     implementation("androidx.media3:media3-datasource-okhttp:1.11.1")
     implementation("io.coil-kt:coil-compose:2.7.0")
+    implementation("androidx.palette:palette-ktx:1.0.0")
+    // Installs the baseline profiles bundled in Compose and Media3: faster first open, less jank.
+    implementation("androidx.profileinstaller:profileinstaller:1.4.1")
+    implementation("dev.chrisbanes.haze:haze:1.5.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-guava:1.10.2")
-    implementation("androidx.compose.material:material-icons-extended")
 
     // Tests
     testImplementation(libs.junit)
@@ -90,4 +95,5 @@ dependencies {
 
     debugImplementation(libs.androidx.compose.ui.test.manifest)
     debugImplementation(libs.androidx.compose.ui.tooling)
+    implementation("io.github.kyant0:backdrop:1.0.6")
 }

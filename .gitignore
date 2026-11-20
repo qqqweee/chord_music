@@ -1,15 +1,49 @@
+
+# Gradle
+.gradle/
+**/build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Android Studio
 *.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+.idea/
+!.idea/runConfigurations/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Local configuration
 local.properties
+
+# Signing keys - NEVER COMMIT
+*.jks
+*.keystore
+keystore.properties
+keys/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Google services credentials
+google-services.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+*.bak
+
+# Generated APKs and App Bundles
+*.apk
+*.aab
+
+# Kotlin
+.kotlin/
