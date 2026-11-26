@@ -17,7 +17,7 @@ android {
         applicationId = "com.example.chord"
         minSdk = 26
         targetSdk = 37
-        versionCode = 2
+        versionCode = 3
         versionName = "1.1.1"
 
         testInstrumentationRunner =
@@ -26,14 +26,13 @@ android {
 
     buildTypes {
         release {
-            // Debug-signed so the release APK installs on your phone. Swap for your own key before Play Store.
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
             optimization {
                 enable = true
-                packageScope = setOf(
-                    "androidx.**",
-                    "kotlin.**",
-                    "kotlinx.**"
-                )
+                packageScope = setOf("androidx.**", "kotlin.**", "kotlinx.**")
             }
         }
     }

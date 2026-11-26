@@ -1,0 +1,4 @@
+-keep class * extends androidx.room.RoomDatabase { <init>(); }
+-keep class androidx.work.impl.WorkDatabase_Impl { *; }
+-keep class androidx.work.** { *; }
+-dontwarn androidx.room.paging.**
