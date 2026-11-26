@@ -103,6 +103,40 @@ import com.example.chord.ui.player.rememberPlayerSheetState
 
 class MainActivity : ComponentActivity() {
 
+    private val notifPermission = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
+    ) { }
+
+    /** Notification tap carries the recap period. ChordApp opens the story. */
+    private fun handleRecapIntent(i: android.content.Intent?) {
+        val name = i?.getStringExtra(com.example.chord.data.stats.RecapNotifier.EXTRA_PERIOD) ?: return
+        i.removeExtra(com.example.chord.data.stats.RecapNotifier.EXTRA_PERIOD)
+        com.example.chord.data.stats.RecapPeriod.values().firstOrNull { it.name == name }
+            ?.let { com.example.chord.data.stats.RecapSchedule.launchRequest = it }
+    }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleRecapIntent(intent)
+    }
+
+    /** Ask for notifications once, after the user has actually listened to something. */
+    private fun askNotificationsOnce() {
+        if (android.os.Build.VERSION.SDK_INT < 33) return
+        val perm = android.Manifest.permission.POST_NOTIFICATIONS
+        if (checkSelfPermission(perm) == android.content.pm.PackageManager.PERMISSION_GRANTED) return
+        val prefs = getSharedPreferences("chord_recap", MODE_PRIVATE)
+        if (prefs.getBoolean("asked_notif", false)) return
+        lifecycleScope.launch {
+            val ms = com.example.chord.data.stats.ListenStatsStore.get(applicationContext).totalMs(365)
+            if (ms >= 5 * 60_000L) {
+                prefs.edit().putBoolean("asked_notif", true).apply()
+                notifPermission.launch(perm)
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
@@ -135,6 +169,11 @@ class MainActivity : ComponentActivity() {
 
         // Look for a newer Chord release on GitHub. Popup shows once per version.
         lifecycleScope.launch { com.example.chord.data.update.AppUpdater.check() }
+
+        // Weekly / monthly / yearly recap notifications.
+        com.example.chord.data.stats.RecapNotifier.schedule(applicationContext)
+        handleRecapIntent(intent)
+        askNotificationsOnce()
 
         setContent {
             MaterialTheme(
@@ -177,6 +216,18 @@ private fun ChordApp(
     var showLogin by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
     var showExploreUpdates by remember { mutableStateOf(false) }
+    // Recap story: open one, or show the Home teaser when a new one dropped.
+    var recap by remember { mutableStateOf<com.example.chord.data.stats.RecapPeriod?>(null) }
+    var recapReady by remember { mutableStateOf<com.example.chord.data.stats.RecapPeriod?>(null) }
+    var recapTick by remember { mutableStateOf(0) }
+    val recapCtx = androidx.compose.ui.platform.LocalContext.current
+    val recapLaunch = com.example.chord.data.stats.RecapSchedule.launchRequest
+    LaunchedEffect(recapLaunch) {
+        if (recapLaunch != null) { recap = recapLaunch; com.example.chord.data.stats.RecapSchedule.launchRequest = null }
+    }
+    LaunchedEffect(recap, recapTick) {
+        recapReady = if (recap == null) com.example.chord.data.stats.RecapSchedule.ready(recapCtx) else null
+    }
     val updatesContext = androidx.compose.ui.platform.LocalContext.current
     val updatesStore = remember(updatesContext) { com.example.chord.data.home.ExploreUpdatesStore.get(updatesContext) }
     val exploreUpdates by updatesStore.updates.collectAsState()
@@ -196,6 +247,11 @@ private fun ChordApp(
     var artist by remember { mutableStateOf<HomeItem?>(null) }
     var lastArtist by remember { mutableStateOf<HomeItem?>(null) }
     if (artist != null) lastArtist = artist
+    // Name of artist being looked up. Not null = loader screen is up.
+    var artistLoading by remember { mutableStateOf<String?>(null) }
+    var lastArtistLoading by remember { mutableStateOf("") }
+    if (artistLoading != null) lastArtistLoading = artistLoading!!
+    var artistJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
 
     val currentSong = playbackState.queue.getOrNull(playbackState.currentQueueIndex)
     // Song waiting in the "Add to playlist" sheet. null = sheet closed.
@@ -233,8 +289,9 @@ private fun ChordApp(
         sheet.collapse()
     }
 
-    BackHandler(enabled = sheetOpen || mixId != null || detail != null || artist != null || destination != Destination.Home) {
+    BackHandler(enabled = sheetOpen || artistLoading != null || mixId != null || detail != null || artist != null || destination != Destination.Home) {
         when {
+            artistLoading != null -> { artistJob?.cancel(); artistLoading = null }
             sheetOpen -> dismissPlayer()
             mixId != null -> mixId = null
             detail != null -> detail = null
@@ -299,11 +356,24 @@ private fun ChordApp(
     } }
     // Menu "Open artist": find the artist, open its page. If not found, fall back to search.
     val openArtistByName: (String) -> Unit = { name ->
-        if (name.isNotBlank()) sleepScope.launch {
-            val hit = com.example.chord.data.home.HomeRepository().search(name).getOrNull()
-                ?.firstOrNull { it.type == HomeItemType.Artist && it.browseId != null }
-            if (hit != null) { artist = hit; detail = null }
-            else { searchViewModel.submit(name); destination = Destination.Search; artist = null; detail = null }
+        if (name.isNotBlank()) {
+            artistJob?.cancel()
+            // Show loader at once, so no blank home while the lookup runs.
+            artistLoading = name
+            artistJob = sleepScope.launch {
+                val started = System.currentTimeMillis()
+                val hit = try {
+                    com.example.chord.data.home.HomeRepository().search(name).getOrNull()
+                        ?.firstOrNull { it.type == HomeItemType.Artist && it.browseId != null }
+                } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) { null }
+                // Keep loader up at least 450ms so it does not flash.
+                val left = 450L - (System.currentTimeMillis() - started)
+                if (left > 0) kotlinx.coroutines.delay(left)
+                if (hit != null) { artist = hit; detail = null; mixId = null }
+                else { searchViewModel.submit(name); destination = Destination.Search; artist = null; detail = null }
+                artistLoading = null
+            }
         }
     }
     val searchArtist: (String) -> Unit = { name ->
@@ -385,6 +455,12 @@ private fun ChordApp(
                                     onUpdates = { showExploreUpdates = true },
                                     nowPlayingId = currentSong?.videoId,
                                     isPlaying = playbackState.isPlaying,
+                                    recapReady = recapReady,
+                                    onOpenRecap = { recap = it },
+                                    onDismissRecap = {
+                                        com.example.chord.data.stats.RecapSchedule.markSeen(recapCtx, it)
+                                        recapTick++
+                                    },
                                     viewModel = homeViewModel,
                                 )
                                 Destination.Explore -> ExploreScreen(
@@ -400,6 +476,7 @@ private fun ChordApp(
                                     onSearchArtist = searchArtist,
                                     onLogin = goLogin,
                                     onOpenBrowse = openItem,
+                                    onOpenRecap = { recap = it },
                                 )
                                 Destination.Search -> SearchScreen(
                                     searchViewModel = searchViewModel,
@@ -419,6 +496,7 @@ private fun ChordApp(
                             onOpenBrowse = openItem,
                             onPlayQueue = playerViewModel::playQueue,
                         )
+                        ArtistLoadingOverlay(visible = artistLoading != null, name = lastArtistLoading)
                         com.example.chord.ui.mixes.MixOverlay(
                             visible = mixId != null,
                             id = lastMix,
@@ -484,6 +562,8 @@ private fun ChordApp(
                             backdrop = navBackdrop,
                             selected = if (showSettings) 4 else destination.ordinal,
                             onSelect = { i ->
+                                artistJob?.cancel()
+                                artistLoading = null
                                 mixId = null
                                 detail = null
                                 artist = null
@@ -555,6 +635,7 @@ private fun ChordApp(
                                 onNext = playerViewModel::next,
                                 onPlayQueueItem = playerViewModel::playQueueItem,
                                 extras = extras,
+                                onOpenArtist = openArtistByName,
                                 sheetState = sheet,
                                 onSheetDrag = sheet::dragBy,
                                 onSheetDragEnd = { v ->
@@ -565,6 +646,28 @@ private fun ChordApp(
                             )
                         }
                     }
+                }
+                recap?.let { period ->
+                    com.example.chord.ui.stats.story.RecapStory(
+                        period = period,
+                        nowPlayingId = currentSong?.videoId,
+                        isPlaying = playbackState.isPlaying,
+                        onPlay = playHome,
+                        onTogglePlay = playerViewModel::togglePlayPause,
+                        onSeek = playerViewModel::seekTo,
+                        onVolume = playerViewModel::setVolume,
+                        snapshot = {
+                            val st = playerViewModel.state.value
+                            com.example.chord.ui.stats.story.PlayerSnap(
+                                st.queue.getOrNull(st.currentQueueIndex)?.videoId, st.isPlaying, st.duration,
+                            )
+                        },
+                        onClose = { played ->
+                            // Story music ends with the story.
+                            if (played && playingNow) playerViewModel.togglePlayPause()
+                            recap = null
+                        },
+                    )
                 }
                 playlistSong?.let { song ->
                     com.example.chord.ui.library.AddToPlaylistSheet(song = song, onDismiss = { playlistSong = null })
@@ -637,5 +740,16 @@ private fun ArtistOverlay(
                 onPlayQueue = onPlayQueue,
             )
         }
+    }
+}
+
+@Composable
+private fun ArtistLoadingOverlay(visible: Boolean, name: String) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn(tween(220)) + scaleIn(tween(320, easing = OpenEase), initialScale = 0.96f),
+        exit = fadeOut(tween(220)),
+    ) {
+        com.example.chord.ui.artist.ArtistLoadingScreen(name = name)
     }
 }

@@ -17,7 +17,7 @@ interface LyricsProvider {
     suspend fun fetch(q: LyricsQuery): String?
 }
 
-private val http = OkHttpClient()
+private val http = com.example.chord.playback.ChordHttp.base
 private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
 private fun b64(s: String) = String(Base64.decode(s, Base64.DEFAULT), Charsets.UTF_8)
 private fun clean(s: String) = s.replace(Regex("""\(.*?\)|\[.*?]"""), "").trim()

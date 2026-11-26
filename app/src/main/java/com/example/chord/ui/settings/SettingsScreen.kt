@@ -150,6 +150,18 @@ fun SettingsScreen(onBack: () -> Unit, onLogin: () -> Unit, modifier: Modifier =
             }
             SettingsSection("Playback") {
                 ChoiceRow(
+                    title = "Streaming quality",
+                    options = listOf(true, false),
+                    selected = AppSettings.losslessStream,
+                    label = { if (it) "Lossless" else "Opus" },
+                    onSelect = AppSettings::setLosslessStream,
+                )
+                InfoRow(
+                    "About",
+                    if (AppSettings.losslessStream) "Lossless needs a fast, steady network. If it fails, the song plays Opus"
+                    else "Opus uses less data and starts fast",
+                )
+                ChoiceRow(
                     title = "Crossfade",
                     options = listOf(0, 2, 4, 6, 8, 12),
                     selected = AppSettings.crossfadeSec,

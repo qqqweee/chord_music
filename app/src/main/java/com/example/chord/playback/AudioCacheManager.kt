@@ -45,6 +45,15 @@ object AudioCacheManager {
     @Synchronized
     fun peek(): Cache? = cache
 
+    /** Drops every cached copy of a song (any provider, any codec). True if something went. */
+    @Synchronized
+    fun evict(videoId: String): Boolean {
+        val c = cache ?: return false
+        val keys = c.keys.filter { it.startsWith("chord/$videoId/") }
+        keys.forEach { runCatching { c.removeResource(it) } }
+        return keys.isNotEmpty()
+    }
+
     private fun provider(context: Context) = db ?: StandaloneDatabaseProvider(context.applicationContext).also { db = it }
 
     @Synchronized

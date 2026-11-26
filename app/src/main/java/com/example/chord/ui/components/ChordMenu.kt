@@ -392,30 +392,19 @@ fun isCached(context: Context, videoId: String): Boolean = try {
 
 /**
  * Downloads the whole stream into the stream cache in the background.
- * Uses the same chord:// uri as playback, so the cache key matches and playback hits it.
+ * Uses the same data path as playback, so the cache key matches and playback hits it.
  */
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 fun addToCache(context: Context, song: Song) {
     val app = context.applicationContext
     kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
         try {
-            val cache = com.example.chord.playback.AudioCacheManager.getInstance(app)
-            val resolver = com.example.chord.playback.StreamResolver(
-                com.example.chord.playback.AudioStreamExtractor(app)
+            // Same data path as playback (resolve -> cache key per provider -> network).
+            com.example.chord.playback.PlaybackDataSources.cacheWholeSong(
+                app,
+                com.example.chord.playback.AudioStreamExtractor(app),
+                android.net.Uri.parse(com.example.chord.playback.StreamResolver.createDummyUri(song)),
             )
-            val upstream = androidx.media3.datasource.ResolvingDataSource.Factory(
-                androidx.media3.datasource.DefaultHttpDataSource.Factory(), resolver
-            )
-            val source = androidx.media3.datasource.cache.CacheDataSource.Factory()
-                .setCache(cache)
-                .setUpstreamDataSourceFactory(upstream)
-                .createDataSource()
-            val spec = androidx.media3.datasource.DataSpec(
-                android.net.Uri.parse(
-                    com.example.chord.playback.StreamResolver.createDummyUri(song)
-                )
-            )
-            androidx.media3.datasource.cache.CacheWriter(source, spec, null, null).cache()
         } catch (e: Exception) { /* partial data stays usable */ }
     }
 }

@@ -2,13 +2,10 @@ package com.example.chord.playback
 
 import com.example.chord.data.local.LocalMusicRepository
 import android.util.Log
-import androidx.annotation.OptIn
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
-import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import com.example.chord.data.model.Song
 import com.example.chord.data.repository.MusicRepository
 import com.example.chord.data.repository.RadioPage
@@ -23,7 +20,6 @@ import kotlinx.coroutines.sync.withLock
 class PlaybackQueueManager(
     private val player: ExoPlayer,
     private val repository: MusicRepository,
-    private val mediaSourceFactory: DefaultMediaSourceFactory,
     private val scope: CoroutineScope
 ) {
     private val queueMutex = Mutex()
@@ -45,7 +41,6 @@ class PlaybackQueueManager(
         fillJob = scope.launch { fill(generation, minAhead()) }
     }
 
-    @OptIn(UnstableApi::class)
     fun playSingleAndStartRadio(song: Song) {
         cancelFill()
         scope.launch {
@@ -54,7 +49,7 @@ class PlaybackQueueManager(
                 // Phone songs have no radio.
                 if (LocalMusicRepository.isLocal(song.videoId)) isExhausted = true
                 QueueStore.replace(listOf(song))
-                player.setMediaSource(createMediaSource(song))
+                player.setMediaItem(mediaItem(song))
                 player.prepare()
                 player.play()
                 currentGeneration
@@ -85,7 +80,6 @@ class PlaybackQueueManager(
      * Plays a fixed list (playlist or album) from [startIndex]. Radio from the
      * last song fills in when the list runs low, so playback never just stops.
      */
-    @OptIn(UnstableApi::class)
     fun playQueue(songs: List<Song>, startIndex: Int, startPositionMs: Long = 0L) {
         if (songs.isEmpty()) return
         cancelFill()
@@ -101,8 +95,8 @@ class PlaybackQueueManager(
                 seenIds.addAll(songs.map { it.videoId })
 
                 QueueStore.replace(songs)
-                player.setMediaSources(
-                    songs.map { createMediaSource(it) },
+                player.setMediaItems(
+                    songs.map(::mediaItem),
                     startIndex.coerceIn(0, songs.lastIndex),
                     startPositionMs.coerceAtLeast(0L),
                 )
@@ -115,14 +109,13 @@ class PlaybackQueueManager(
     }
 
     /** Play next ([next] = true) or add to the end of the queue. Empty queue: just play it. */
-    @OptIn(UnstableApi::class)
     fun enqueue(song: Song, next: Boolean) {
         if (player.mediaItemCount == 0) { playSingleAndStartRadio(song); return }
         scope.launch {
             queueMutex.withLock {
                 seenIds.add(song.videoId)
                 val at = if (next) player.currentMediaItemIndex + 1 else player.mediaItemCount
-                player.addMediaSource(at.coerceIn(0, player.mediaItemCount), createMediaSource(song))
+                player.addMediaItem(at.coerceIn(0, player.mediaItemCount), mediaItem(song))
             }
         }
     }
@@ -187,7 +180,6 @@ class PlaybackQueueManager(
     }
 
     /** Runs under the mutex. False when the page is stale or the radio has nothing new. */
-    @OptIn(UnstableApi::class)
     private fun appendPage(generation: Int, page: RadioPage): Boolean {
         if (generation != currentGeneration) return false
 
@@ -214,7 +206,7 @@ class PlaybackQueueManager(
         if (candidates.isEmpty()) return !isExhausted
 
         QueueStore.append(candidates)
-        player.addMediaSources(candidates.map { createMediaSource(it) })
+        player.addMediaItems(candidates.map(::mediaItem))
         return true
     }
 
@@ -227,19 +219,7 @@ class PlaybackQueueManager(
         seenIds.add(newSeedId)
     }
 
-    @OptIn(UnstableApi::class)
-    private fun createMediaSource(song: Song): androidx.media3.exoplayer.source.MediaSource {
-        // Last play fell back to YouTube while an addon was on: drop that cached copy so the addon is asked again.
-        if (StreamInfoStore.takeDegraded(song.videoId)) {
-            runCatching { AudioCacheManager.peek()?.removeResource(StreamResolver.createDummyUri(song)) }
-        }
-        return buildMediaSource(song)
-    }
-
-    @OptIn(UnstableApi::class)
-    private fun buildMediaSource(song: Song) = mediaSourceFactory.createMediaSource(buildMediaItem(song))
-
-    private fun buildMediaItem(song: Song): MediaItem =
+    private fun mediaItem(song: Song): MediaItem =
         MediaItem.Builder()
             .setMediaId(song.videoId)
             .setUri(
@@ -268,7 +248,6 @@ class PlaybackQueueManager(
      * Old way restarted the whole queue and radio. Now: same spot, same queue, only this item swaps.
      * Call after the new link is already resolved, so the swap is quick.
      */
-    @OptIn(UnstableApi::class)
     fun swapCurrent(song: Song) {
         scope.launch {
             queueMutex.withLock {
@@ -276,10 +255,8 @@ class PlaybackQueueManager(
                 val item = player.currentMediaItem
                 if (index < 0 || item == null || item.mediaId != song.videoId) return@withLock
                 val position = player.currentPosition
-                val wasPlaying = player.playWhenReady
-                player.replaceMediaItem(index, buildMediaItem(song))
+                player.replaceMediaItem(index, mediaItem(song))
                 player.seekTo(index, position)
-                player.playWhenReady = wasPlaying
             }
         }
     }

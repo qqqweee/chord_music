@@ -1,11 +1,13 @@
 package com.example.chord.playback
 
 import android.net.Uri
+import android.os.SystemClock
 import android.util.Log
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.HttpDataSource
 import com.example.chord.data.local.LocalMusicRepository
 import com.example.chord.data.model.Song
 import com.example.chord.playback.addon.AddonResolver
@@ -16,16 +18,21 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
- * Keeps music playing when a stream dies mid-song (expired link, network blip, dead proxy).
+ * Keeps music playing when a stream dies. Same item, same position, same queue, always.
  *
- * Before: ExoPlayer went IDLE on the first error and stayed there. Tapping play then rebuilt
- * the whole queue for that one song.
+ * Layer 1 is ExoPlayer itself: a failed load is retried and resumed at the byte it reached
+ * (Range request, see [PlaybackDataSources]). This class only sees what that could not fix.
  *
- * Now, on error:
- *   1. Throw away every remembered link for the song, so the next open resolves fresh.
- *   2. After a short back-off, prepare() again. Same item, same position, same queue.
- *   3. From the 2nd try, also drop the half-cached file in case it is the broken part.
- *   4. Out of tries (or error can never be fixed by retry): skip to the next song.
+ * What it does, by kind of error:
+ *   TRANSIENT  timeout, reset, EOF, 5xx: try the SAME stream again, with growing waits.
+ *              The link, the provider and the codec are not touched. One blip never costs FLAC.
+ *   STALE      403/401/404/410, broken file: ask the same providers for a fresh link. Once.
+ *   RATE LIMIT 429: let that provider rest, go to the next one now.
+ *   UNPLAYABLE decoder refuses this provider's file: next provider.
+ *
+ * Next provider ([fallBack]) comes only after the steps above failed. The failing provider rests
+ * for a while ([ProviderHealth]) and is tried again later. It is never banned for good.
+ * Offline: nothing is switched and nothing is skipped. The song waits, the play button retries.
  *
  * All calls must come from the player's thread (service scope is Main).
  */
@@ -33,89 +40,111 @@ import kotlinx.coroutines.launch
 class PlaybackRecovery(
     private val player: Player,
     private val scope: CoroutineScope,
+    /** True when the phone has a network. Offline errors must not burn providers or the queue. */
+    private val isOnline: () -> Boolean = { true },
 ) : Player.Listener {
 
-    private var attempts = 0
-    private var skipsInARow = 0
+    private var netRetries = 0
+    private var refreshed = false
+    private var fallbacks = 0
+    private var lastErrorAt = 0L
     private var retryJob: Job? = null
-    private var healthyJob: Job? = null
+
+    private enum class Kind { TRANSIENT, STALE, RATE_LIMITED, UNPLAYABLE }
 
     override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-        // New song: clean slate. An error-triggered skip must not inherit old failures.
+        // New song: clean slate.
         retryJob?.cancel()
-        attempts = 0
-    }
-
-    override fun onIsPlayingChanged(isPlaying: Boolean) {
-        healthyJob?.cancel()
-        if (!isPlaying) return
-        // Only forgive old failures after a steady stretch of real playback.
-        healthyJob = scope.launch {
-            delay(HEALTHY_AFTER_MS)
-            attempts = 0
-            skipsInARow = 0
-        }
+        netRetries = 0
+        refreshed = false
+        fallbacks = 0
+        lastErrorAt = 0L
     }
 
     override fun onPlayerError(error: PlaybackException) {
         val item = player.currentMediaItem ?: return
-        Log.w(TAG, "player error ${error.errorCodeName} on ${item.mediaId} (attempt ${attempts + 1})", error)
-
-        // Remember the drop. Resolver is patient with the lossless source for a while after.
-        if (error.isNetwork()) StreamResolver.noteNetworkLoss()
-
-        // Was FLAC when it stopped: retries must find FLAC again, not slide to AAC.
-        if (item.localConfiguration?.uri?.scheme == "chord" && wasLossless(item)) {
-            StreamResolver.requireLossless(item.mediaId)
-        }
+        Log.w(TAG, "player error ${error.errorCodeName} on ${item.mediaId} (net $netRetries, fallbacks $fallbacks)", error)
 
         // Paused by the person: do not wake playback behind their back. Play button retries.
         if (!player.playWhenReady) return
 
-        // Saved song whose file vanished (deleted, folder gone, permission lost): stream it instead.
+        // Saved song whose file vanished: stream it instead.
         if (error.isMissingFile() && fallBackToStream(item)) return
 
-        val streamed = item.localConfiguration?.uri?.scheme == "chord"
-        if (!streamed || !error.isRetryable() || attempts >= MAX_ATTEMPTS) {
-            // No internet: skipping would only burn through the whole queue. Stop here, keep the spot.
-            if (error.isNetwork()) {
-                attempts = 0
-                player.pause()
-                return
-            }
-            skipOrGiveUp()
+        if (item.localConfiguration?.uri?.scheme != "chord" || error.isMissingFile()) {
+            skip()
             return
         }
 
-        attempts++
-        val attempt = attempts
+        // The song played fine for a while since the last error: earlier trouble is forgiven.
+        val now = SystemClock.elapsedRealtime()
+        if (lastErrorAt != 0L && now - lastErrorAt > QUIET_RESET_MS) {
+            netRetries = 0
+            refreshed = false
+        }
+        lastErrorAt = now
+
+        when (error.kind()) {
+            Kind.TRANSIENT -> when {
+                netRetries < NET_RETRIES -> retrySame(item)
+                !isOnline() -> netRetries = 0               // offline: wait here, play button retries
+                !fallBack(item) -> giveUp(error)
+            }
+            Kind.STALE -> when {
+                !refreshed -> refresh(item, error)
+                !fallBack(item) -> giveUp(error)
+            }
+            Kind.RATE_LIMITED -> {
+                if (item.currentProvider().startsWith("monochrome:")) MonochromeResolver.backOff(error.retryAfter())
+                if (!fallBack(item, error.retryAfterMs())) giveUp(error)
+            }
+            Kind.UNPLAYABLE -> if (!fallBack(item)) skip()
+        }
+    }
+
+    /** Same stream, same link, same spot. The disk cache keeps what already arrived. */
+    private fun retrySame(item: MediaItem) {
+        val attempt = ++netRetries
         retryJob?.cancel()
         retryJob = scope.launch {
-            delay(BACKOFF_MS * attempt)
-            // Item may have changed while we waited.
-            if (player.currentMediaItem?.mediaId != item.mediaId) return@launch
-            // Glued FLAC+AAC file (see StreamResolver.checkSameSource): always start the cache clean.
-            val glued = error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED
-            if (attempt >= MAX_ATTEMPTS) StreamResolver.allowFallback(item.mediaId)   // last try: AAC is better than silence
-            forgetStream(item, dropDisk = attempt >= 2 || glued)
+            delay(BACKOFF_MS shl (attempt - 1))   // 1 s, 2 s, 4 s
+            if (player.currentMediaItem?.mediaId != item.mediaId) return@launch   // person skipped
             player.prepare()
         }
     }
 
-    private fun wasLossless(item: MediaItem): Boolean {
-        val id = item.mediaId
-        val src = StreamInfoStore.cacheSource(id)
-        return src == "flac" || src == "alac" || StreamInfoStore.isLosslessLabel(StreamInfoStore.labels.value[id])
+    /** Link looks dead or wrong: ask again, same providers. Same spot. */
+    private fun refresh(item: MediaItem, error: PlaybackException) {
+        refreshed = true
+        // A file that will not parse may be a half or broken copy on disk (Mochy drops it too): start clean.
+        if (error.isParseError()) AudioCacheManager.evict(item.mediaId)
+        forgetLinks(item, deadId = error.statusCode() == 404 || error.statusCode() == 410)
+        player.prepare()
     }
 
-    private fun skipOrGiveUp() {
-        attempts = 0
-        // Many dead songs in a row = something bigger (no network, dead source). Stop, do not skip forever.
-        if (++skipsInARow > MAX_SKIPS_IN_A_ROW) {
-            skipsInARow = 0
-            player.pause()
-            return
-        }
+    /**
+     * Move this song to the next provider, from the same spot. False when there is none left
+     * (YouTube is already playing, or too many switches). The failed provider rests, not banned.
+     */
+    private fun fallBack(item: MediaItem, restMs: Long = 0L): Boolean {
+        val provider = item.currentProvider()
+        if (provider.isBlank() || provider == ProviderHealth.YOUTUBE || fallbacks >= MAX_FALLBACKS) return false
+        fallbacks++
+        netRetries = 0
+        refreshed = false
+        ProviderHealth.markFailed(provider, restMs)
+        forgetLinks(item, deadId = false)
+        Log.w(TAG, "${item.mediaId}: $provider failed after recovery, trying the next provider")
+        player.prepare()
+        return true
+    }
+
+    /** Nothing left to try. Network trouble: stay on the song. Anything else: next song. */
+    private fun giveUp(error: PlaybackException) {
+        if (error.isNetwork()) netRetries = 0 else skip()
+    }
+
+    private fun skip() {
         if (player.hasNextMediaItem()) {
             player.seekToNextMediaItem()
             player.prepare()
@@ -131,13 +160,8 @@ class PlaybackRecovery(
         val index = player.currentMediaItemIndex
         if (index < 0) return false
         val position = player.currentPosition.coerceAtLeast(0L)
-        val song = Song(
-            title = item.mediaMetadata.title?.toString().orEmpty(),
-            details = item.mediaMetadata.artist?.toString().orEmpty(),
-            videoId = item.mediaId,
-        )
         val streamItem = item.buildUpon()
-            .setUri(Uri.parse(StreamResolver.createDummyUri(song)))
+            .setUri(Uri.parse(StreamResolver.createDummyUri(item.toSong())))
             .build()
         player.replaceMediaItem(index, streamItem)
         player.seekTo(index, position)
@@ -145,71 +169,83 @@ class PlaybackRecovery(
         return true
     }
 
-    private fun PlaybackException.isMissingFile(): Boolean = when (errorCode) {
-        PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
-        PlaybackException.ERROR_CODE_IO_NO_PERMISSION -> true
-        else -> false
+    /** Forget every in-memory link, so the next open resolves fresh. */
+    private fun forgetLinks(item: MediaItem, deadId: Boolean) {
+        val song = item.toSong()
+        StreamResolver.forget(song.videoId)
+        AddonResolver.forgetMemo(song)
+        MonochromeResolver.forget(song)
+        // Server says "no such track": the saved match is wrong, search again.
+        if (deadId) MonochromeResolver.forgetSavedId(song)
     }
 
-    private fun PlaybackException.isNetwork(): Boolean {
-        when (errorCode) {
-            PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
-            PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT -> return true
+    private fun MediaItem.currentProvider(): String = StreamResolver.currentStream(mediaId)?.provider.orEmpty()
+
+    private fun MediaItem.toSong() = Song(
+        title = mediaMetadata.title?.toString().orEmpty(),
+        details = mediaMetadata.artist?.toString().orEmpty(),
+        videoId = mediaId,
+    )
+
+    private fun PlaybackException.isMissingFile() = errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND ||
+            errorCode == PlaybackException.ERROR_CODE_IO_NO_PERMISSION
+
+    private fun PlaybackException.kind(): Kind {
+        val status = statusCode()
+        return when {
+            status == 429 -> Kind.RATE_LIMITED
+            status == 401 || status == 403 || status == 404 || status == 410 || status == 416 -> Kind.STALE
+            // 200 OK with a web page or half a file instead of audio.
+            isParseError() -> Kind.STALE
+            errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ||
+                    errorCode == PlaybackException.ERROR_CODE_DECODER_QUERY_FAILED ||
+                    errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED ||
+                    errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED ||
+                    errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED -> Kind.UNPLAYABLE
+            else -> Kind.TRANSIENT   // timeouts, resets, EOF, 5xx, lookup failures
         }
-        // Link lookup runs inside the data source. Offline, it dies with UnknownHostException,
-        // and ExoPlayer files that as plain IO_UNSPECIFIED. Still a lost network: pause, do not skip.
-        var t: Throwable? = cause
-        var depth = 0
-        while (t != null && depth++ < 8) {
-            if (t is java.net.UnknownHostException ||
-                t is java.net.ConnectException ||
-                t is java.net.NoRouteToHostException ||
-                t is java.net.SocketTimeoutException
-            ) return true
-            t = t.cause
-        }
-        return false
     }
 
-    private fun PlaybackException.isRetryable(): Boolean = when (errorCode) {
-        PlaybackException.ERROR_CODE_DECODER_INIT_FAILED,
-        PlaybackException.ERROR_CODE_DECODER_QUERY_FAILED,
-        PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED,
-        PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED,
-        PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
-        PlaybackException.ERROR_CODE_IO_NO_PERMISSION -> false
-        else -> true
-    }
+    private fun PlaybackException.isParseError() =
+        errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED ||
+                errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED
+
+    private fun PlaybackException.statusCode(): Int? =
+        (cause as? HttpDataSource.InvalidResponseCodeException)?.responseCode
+
+    private fun PlaybackException.retryAfter(): String? =
+        (cause as? HttpDataSource.InvalidResponseCodeException)?.headerFields?.entries
+            ?.firstOrNull { it.key.equals("Retry-After", ignoreCase = true) }?.value?.firstOrNull()
+
+    private fun PlaybackException.retryAfterMs(): Long =
+        retryAfter()?.trim()?.toLongOrNull()?.times(1000)?.coerceIn(5_000L, 10 * 60_000L) ?: 0L
+
+    /**
+     * Network trouble. Link lookup runs inside the data source, so offline it dies as a wrapped
+     * UnknownHostException that ExoPlayer files as plain IO_UNSPECIFIED. Look at the causes too.
+     */
+    private fun PlaybackException.isNetwork(): Boolean =
+        errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
+                errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT ||
+                generateSequence(cause) { it.cause }.take(8).any {
+                    it is java.net.UnknownHostException || it is java.net.SocketException ||
+                            it is java.net.SocketTimeoutException || it is java.io.EOFException
+                }
 
     fun release() {
         retryJob?.cancel()
-        healthyJob?.cancel()
     }
 
-    companion object {
-        private const val TAG = "ChordRecovery"
-        private const val MAX_ATTEMPTS = 3
-        private const val BACKOFF_MS = 1_000L
-        private const val HEALTHY_AFTER_MS = 15_000L
-        private const val MAX_SKIPS_IN_A_ROW = 5
-
-        /** Forget every in-memory link for this song. Optionally drop its disk cache entry too. */
-        fun forgetStream(item: MediaItem, dropDisk: Boolean) {
-            val id = item.mediaId
-            StreamResolver.forget(id)
-            val song = Song(
-                title = item.mediaMetadata.title?.toString().orEmpty(),
-                details = item.mediaMetadata.artist?.toString().orEmpty(),
-                videoId = id,
-            )
-            AddonResolver.forgetMemo(song)
-            MonochromeResolver.forget(song)
-            if (dropDisk) {
-                val key = item.localConfiguration?.uri?.toString() ?: return
-                runCatching { AudioCacheManager.peek()?.removeResource(key) }
-                // Cache is empty now, so the note about its format is stale too.
-                StreamInfoStore.setCacheSource(id, null)
-            }
-        }
+    private companion object {
+        const val TAG = "ChordRecovery"
+        // ===================== TUNABLES (safe to change) =====================
+        /** Same-stream retries before a link refresh or a provider switch. Waits 1 s, 2 s, 4 s. */
+        const val NET_RETRIES = 3
+        const val BACKOFF_MS = 1_000L
+        /** Provider switches allowed per song (several Monochrome servers + addons, then YouTube). */
+        const val MAX_FALLBACKS = 3
+        /** Playing this long without an error clears the retry counters. */
+        const val QUIET_RESET_MS = 60_000L
+        // ====================================================================
     }
 }

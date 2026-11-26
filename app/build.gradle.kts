@@ -17,8 +17,8 @@ android {
         applicationId = "com.example.chord"
         minSdk = 26
         targetSdk = 37
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1.1"
 
         testInstrumentationRunner =
             "androidx.test.runner.AndroidJUnitRunner"
@@ -27,7 +27,6 @@ android {
     buildTypes {
         release {
             // Debug-signed so the release APK installs on your phone. Swap for your own key before Play Store.
-            signingConfig = signingConfigs.getByName("debug")
             optimization {
                 enable = true
                 packageScope = setOf(
@@ -39,6 +38,7 @@ android {
         }
     }
 
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
@@ -46,6 +46,16 @@ android {
 
     buildFeatures {
         compose = true
+    }
+}
+
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        variant.outputs.forEach { output ->
+            output.outputFileName.set(
+                "Chord-${android.defaultConfig.versionName}.apk"
+            )
+        }
     }
 }
 
@@ -92,6 +102,7 @@ dependencies {
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(libs.androidx.junit)
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
 
     debugImplementation(libs.androidx.compose.ui.test.manifest)
     debugImplementation(libs.androidx.compose.ui.tooling)

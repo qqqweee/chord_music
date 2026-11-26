@@ -7,11 +7,7 @@ import android.os.Looper
 import android.provider.DocumentsContract
 import android.util.Log
 import android.widget.Toast
-import androidx.media3.common.C
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.DataSpec
-import androidx.media3.datasource.DefaultHttpDataSource
-import androidx.media3.datasource.ResolvingDataSource
 import com.example.chord.data.local.LocalMusicRepository
 import com.example.chord.data.model.Song
 import com.example.chord.data.repository.LyricsRepository
@@ -36,8 +32,8 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import com.example.chord.playback.addon.AddonResolver
 import com.example.chord.playback.addon.AddonStore
-import com.example.chord.playback.addon.MonochromeResolver
 import com.example.chord.data.history.HistoryStore
+import com.example.chord.playback.addon.MonochromeResolver
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import okhttp3.OkHttpClient
@@ -49,10 +45,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.io.OutputStream
 
 @androidx.annotation.OptIn(UnstableApi::class)
 object DownloadStore {
@@ -90,10 +84,7 @@ object DownloadStore {
         if (free < bytes + 50L * 1024 * 1024) throw NoSpaceException("Not enough storage")
     }
 
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .build()
+    private val http = com.example.chord.playback.ChordHttp.download
 
     private val gate = Semaphore(2)
     private val jobs = HashMap<String, Job>()

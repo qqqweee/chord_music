@@ -32,6 +32,10 @@ data class AudioStream(
     val mimeType: String? = null,
     val contentLength: Long? = null,
     val chunkSize: Long = 0L,
+    /** Who serves it: "monochrome:<server>", "addon:<url>", "youtube". Health and cache identity. */
+    val provider: String = "",
+    /** Stable id of the file inside that provider (track id). Signed URLs change, this does not. */
+    val trackKey: String = "",
 )
 
 class AudioStreamExtractor(context: Context) {
@@ -107,7 +111,6 @@ class AudioStreamExtractor(context: Context) {
                 }
 
                 val quality = StreamInfoStore.label(stream.codecs, stream.mimeType, stream.bitrate, stream.sampleRate)
-                StreamInfoStore.put(videoId, quality)
 
                 AudioStream(
                     url = stream.audioUrl,
@@ -116,6 +119,8 @@ class AudioStreamExtractor(context: Context) {
                     mimeType = stream.mimeType,
                     contentLength = stream.contentLengthBytes,
                     chunkSize = stream.rangeChunkSizeBytes,
+                    provider = ProviderHealth.YOUTUBE,
+                    trackKey = videoId,
                 )
             } finally {
                 innerTube.close()

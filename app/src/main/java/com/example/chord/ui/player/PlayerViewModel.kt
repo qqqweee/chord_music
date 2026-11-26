@@ -206,6 +206,7 @@ class PlayerViewModel(
     fun togglePlayPause() = playbackController.togglePlayPause()
     fun setSleepTimer(minutes: Int) { playbackController.setSleepTimer(minutes) }
     fun seekTo(positionMs: Long) = playbackController.seekTo(positionMs)
+    fun setVolume(volume: Float) = playbackController.setVolume(volume)
     fun next() = playbackController.next()
     fun previous() = playbackController.previous()
     fun playQueueItem(index: Int) = playbackController.playQueueItem(index)

@@ -57,9 +57,8 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.chord.data.home.HomeItem
 import com.example.chord.data.library.PlaylistSummary
 import com.example.chord.data.model.Song
-import com.example.chord.data.stats.ListenStats
-import com.example.chord.data.stats.ListenStatsStore
-import com.example.chord.ui.stats.StatsCards
+import com.example.chord.data.stats.RecapPeriod
+import com.example.chord.ui.stats.RecapShelf
 import com.example.chord.ui.components.ChordDialog
 import com.example.chord.ui.components.ChordMenu
 import com.example.chord.ui.components.ChordMenuItem
@@ -97,6 +96,7 @@ fun LibraryScreen(
     onLogin: () -> Unit,
     modifier: Modifier = Modifier,
     onOpenBrowse: (HomeItem) -> Unit = {},
+    onOpenRecap: (RecapPeriod) -> Unit = {},
     viewModel: LibraryViewModel = viewModel(),
 ) {
     var sub by remember { mutableStateOf<Sub?>(null) }
@@ -108,7 +108,6 @@ fun LibraryScreen(
 
     // YouTube Music playlists: cached list at once, synced again when stale / on sign-in.
     val ctx = androidx.compose.ui.platform.LocalContext.current
-    val listenStats by remember { ListenStatsStore.get(ctx).stats() }.collectAsState(initial = ListenStats())
     remember { com.example.chord.data.library.YtLibrary.init(ctx) }
     val signedIn by com.example.chord.data.auth.AuthStore.signedIn.collectAsState()
     androidx.compose.runtime.LaunchedEffect(signedIn) { com.example.chord.data.library.YtLibrary.refresh() }
@@ -168,12 +167,8 @@ fun LibraryScreen(
         }
         item(key = "listening-stats") {
             Column(Modifier.padding(top = 8.dp)) {
-                Header("Your listening")
-                StatsCards(
-                    stats = listenStats,
-                    onItem = onPlaySong,
-                    modifier = Modifier.fillMaxWidth(),
-                )
+                Header("Your recaps")
+                RecapShelf(onOpen = onOpenRecap, modifier = Modifier.fillMaxWidth())
             }
         }
         item(key = "rows") {

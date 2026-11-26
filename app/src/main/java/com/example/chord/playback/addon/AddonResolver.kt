@@ -6,6 +6,7 @@ import androidx.annotation.OptIn
 import androidx.media3.common.util.UnstableApi
 import com.example.chord.data.model.Song
 import com.example.chord.playback.AudioCacheManager
+import com.example.chord.playback.ProviderHealth
 import com.example.chord.playback.AudioStream
 import com.example.chord.playback.StreamInfoStore
 import com.example.chord.playback.StreamResolver
@@ -43,9 +44,10 @@ object AddonResolver {
         StreamInfoStore.setBusy(videoId, true)
         try {
             for (addon in addons) {
+                // Failed lately: rest it, ask the next one. It is tried again after its rest.
+                if (ProviderHealth.isDown("addon:${addon.url}")) continue
                 try {
                     val stream = resolveFromAddon(addon, title, artist) ?: continue
-                    StreamInfoStore.put(videoId, stream.quality)
                     memo[key] = Memo(stream, System.currentTimeMillis())
                     if (memo.size > 200) memo.entries.removeIf { System.currentTimeMillis() - it.value.at > MEMO_MS }
                     return stream
@@ -54,6 +56,7 @@ object AddonResolver {
                         // Needs a key we do not have (bitchordAuth = official BitChord app only).
                         AddonStore.markOfficialOnly(addon.url)
                     }
+                    ProviderHealth.markFailed("addon:${addon.url}")
                     Log.w(TAG, "${addon.name} failed for \"$title\": ${e.message}")
                 }
             }
@@ -85,8 +88,8 @@ object AddonResolver {
 
     fun evictDisk(context: Context, song: Song) {
         runCatching {
-            AudioCacheManager.getInstance(context)
-                .removeResource(StreamResolver.createDummyUri(song))
+            AudioCacheManager.getInstance(context)   // opens the cache if needed
+            AudioCacheManager.evict(song.videoId)
         }
     }
 
@@ -246,9 +249,11 @@ object AddonResolver {
 
         return AudioStream(
             url = url,
-            headers = headers,
+            headers = headers,   // this addon's own key/token headers
             quality = label,
-            mimeType = mime
+            mimeType = mime,
+            provider = "addon:${addon.url}",
+            trackKey = id.ifBlank { url.substringBefore('?').hashCode().toUInt().toString(16) },
         )
     }
 

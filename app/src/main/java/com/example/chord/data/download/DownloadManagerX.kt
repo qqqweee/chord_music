@@ -57,10 +57,7 @@ class DownloadManagerX private constructor(private val ctx: Context) :
     private val paths = ConcurrentHashMap<String, String>()
     private val cancelled = ConcurrentHashMap.newKeySet<String>()
     private val extractor = AudioStreamExtractor(ctx)
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .build()
+    private val http = com.example.chord.playback.ChordHttp.download
 
     private val _active = MutableStateFlow<Map<String, Float>>(emptyMap())
     val active: StateFlow<Map<String, Float>> = _active.asStateFlow()

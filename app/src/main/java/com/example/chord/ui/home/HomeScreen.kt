@@ -82,6 +82,9 @@ fun HomeScreen(
     modifier: Modifier = Modifier,
     nowPlayingId: String? = null,
     isPlaying: Boolean = false,
+    recapReady: com.example.chord.data.stats.RecapPeriod? = null,
+    onOpenRecap: (com.example.chord.data.stats.RecapPeriod) -> Unit = {},
+    onDismissRecap: (com.example.chord.data.stats.RecapPeriod) -> Unit = {},
     viewModel: HomeViewModel = viewModel(),
 ) {
     val state by viewModel.state.collectAsState()
@@ -151,6 +154,11 @@ fun HomeScreen(
                     ) {
                         item(key = "header", contentType = TYPE_HEADER) {
                             HomeHeader(signedIn, onSearch, onLogin, onSettings, hasUpdates, onUpdates)
+                        }
+                        if (recapReady != null) {
+                            item(key = "recap-teaser-${recapReady.name}") {
+                                RecapTeaser(recapReady, { onOpenRecap(recapReady) }, { onDismissRecap(recapReady) })
+                            }
                         }
                         items(
                             items = state.shelves,

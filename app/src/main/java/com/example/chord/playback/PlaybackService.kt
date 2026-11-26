@@ -8,9 +8,6 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.DefaultHttpDataSource
-import androidx.media3.datasource.ResolvingDataSource
-import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
@@ -25,8 +22,6 @@ import com.example.chord.data.model.Song
 import com.example.chord.data.repository.MusicRepository
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
-import androidx.media3.datasource.DataSpec
-import androidx.media3.datasource.cache.CacheWriter
 import androidx.media3.session.SessionError
 import com.example.chord.playback.addon.AddonResolver
 import kotlinx.coroutines.CancellationException
@@ -36,7 +31,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.withContext
 import com.example.chord.data.history.HistoryStore
 import kotlinx.coroutines.delay
@@ -59,26 +53,24 @@ class PlaybackService : MediaSessionService() {
                 CoroutineExceptionHandler { _, e -> android.util.Log.e("ChordService", "Uncaught in service scope", e) }
     )
     private var countedId: String? = null
+    private var bufferStartedAt = 0L
 
     private val extractor by lazy { AudioStreamExtractor(applicationContext) }
-    private var warmFactory: CacheDataSource.Factory? = null
     private var prefetchJob: Job? = null
     private var prefetchKey: String? = null
 
     /**
-     * Get the next songs ready while the current one plays, so skip and song end do not wait
+     * Get the next song ready while the current one plays, so skip and song end do not wait
      * for search + link lookup on a slow link.
-     *   1. Find the stream link for the next 1-2 songs (small requests).
-     *   2. When the current song has a cushion, save the first ~0.75 MB of the next one to disk,
-     *      so it starts at once.
+     * Find the stream link for the NEXT song only (i + 1; in shuffle, the real next one).
      */
     private fun schedulePrefetch() {
         val cur = player.currentMediaItem?.mediaId ?: return
+        // Only the next track. (Before: i + 1 and i + 2, two extra requests on the same server.)
         val candidates = if (player.shuffleModeEnabled) {
             listOf(player.nextMediaItemIndex)
         } else {
-            val i = player.currentMediaItemIndex
-            listOf(i + 1, i + 2)
+            listOf(player.currentMediaItemIndex + 1)
         }
         val nextIndexes = candidates.filter { it in 0 until player.mediaItemCount }
         val items = nextIndexes.map { player.getMediaItemAt(it) }
@@ -92,10 +84,10 @@ class PlaybackService : MediaSessionService() {
             var waited = 0L
             while (player.playbackState == Player.STATE_BUFFERING && waited < 30_000) { delay(300); waited += 300 }
 
-            for ((n, item) in items.withIndex()) {
+            for (item in items) {
                 val uri = item.localConfiguration?.uri ?: continue
                 if (uri.scheme != "chord") continue
-                val ready = withContext(Dispatchers.IO) {
+                withContext(Dispatchers.IO) {
                     StreamResolver.prefetch(
                         extractor,
                         item.mediaId,
@@ -103,36 +95,6 @@ class PlaybackService : MediaSessionService() {
                         uri.getQueryParameter("a").orEmpty(),
                     )
                 }
-                if (n == 0 && ready) warmCache(uri)
-            }
-        }
-    }
-
-    @Suppress("UNUSED_PARAMETER")
-    private suspend fun warmCache(uri: android.net.Uri) {
-        val factory = warmFactory ?: return
-        val key = uri.toString()
-        if (runCatching { AudioCacheManager.getInstance(applicationContext).isCached(key, 0, WARM_BYTES) }.getOrDefault(false)) return
-
-        // Only when the current song has a cushion. Warm-up must never starve what is playing.
-        var waited = 0L
-        while (player.totalBufferedDuration < 10_000 && waited < 90_000) { delay(1_000); waited += 1_000 }
-        if (player.totalBufferedDuration < 10_000) return
-
-        withContext(Dispatchers.IO) {
-            val writer = CacheWriter(
-                factory.createDataSource(),
-                DataSpec.Builder().setUri(uri).setPosition(0).setLength(WARM_BYTES).build(),
-                null,
-                null,
-            )
-            val handle = currentCoroutineContext()[Job]?.invokeOnCompletion { if (it != null) writer.cancel() }
-            try {
-                writer.cache()
-            } catch (e: Exception) {
-                android.util.Log.w("ChordPrefetch", "warm-up stopped: ${e.message}")
-            } finally {
-                handle?.dispose()
             }
         }
     }
@@ -172,14 +134,26 @@ class PlaybackService : MediaSessionService() {
         )
         serviceScope.launch {
             withContext(Dispatchers.IO) {
+                // Upgrade must beat every remembered choice: chosen source, YouTube link,
+                // Monochrome "no match" / old link.
+                StreamResolver.forget(cur.videoId)
+                com.example.chord.playback.addon.MonochromeResolver.forget(cur)
+                com.example.chord.playback.addon.MonochromeResolver.forgetSavedId(cur)
                 AddonResolver.forgetMemo(cur)
                 val uri = android.net.Uri.parse(StreamResolver.createDummyUri(cur))
+                // Old cached copy must go BEFORE the lookup, or the "fully cached" shortcut hides the upgrade.
+                AudioCacheManager.evict(cur.videoId)
+                StreamInfoStore.setLastCacheKey(cur.videoId, null)
                 StreamResolver.prefetch(
                     extractor, cur.videoId,
                     uri.getQueryParameter("t").orEmpty(),
                     uri.getQueryParameter("a").orEmpty(),
                 )
                 AddonResolver.evictDisk(applicationContext, cur)
+                // Upgrade asked: drop every cached copy of this song (any provider). Keys are per
+                // provider, so nothing could glue, but the old copy would be picked up again.
+                AudioCacheManager.evict(cur.videoId)
+                StreamInfoStore.setLastCacheKey(cur.videoId, null)
             }
             queueManager.swapCurrent(cur)
         }
@@ -209,7 +183,27 @@ class PlaybackService : MediaSessionService() {
 
                     // Queue ran dry before radio answered: fetch more and carry on.
                     override fun onPlaybackStateChanged(playbackState: Int) {
+                        // Timing log: adb logcat -s ChordBuffer
+                        val now = android.os.SystemClock.elapsedRealtime()
+                        if (playbackState == Player.STATE_BUFFERING) bufferStartedAt = now
+                        else if (bufferStartedAt != 0L) {
+                            android.util.Log.i("ChordBuffer", "buffering ended after ${now - bufferStartedAt} ms -> state $playbackState, item ${currentMediaItem?.mediaId}")
+                            bufferStartedAt = 0L
+                        }
                         if (playbackState == Player.STATE_ENDED && ::queueManager.isInitialized) queueManager.onPlaybackEnded()
+                    }
+
+                    // Log every play/pause flip and who caused it: adb logcat -s ChordPlay
+                    override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                        val why = when (reason) {
+                            Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST -> "USER_REQUEST"
+                            Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS -> "AUDIO_FOCUS_LOSS"
+                            Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY -> "AUDIO_BECOMING_NOISY"
+                            Player.PLAY_WHEN_READY_CHANGE_REASON_REMOTE -> "REMOTE"
+                            Player.PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM -> "END_OF_MEDIA_ITEM"
+                            else -> "reason=$reason"
+                        }
+                        android.util.Log.i("ChordPlay", "playWhenReady=$playWhenReady ($why) state=$playbackState item=${currentMediaItem?.mediaId}")
                     }
                 })
             }
@@ -217,13 +211,14 @@ class PlaybackService : MediaSessionService() {
         queueManager = PlaybackQueueManager(
             player = player,
             repository = MusicRepository(applicationContext),
-            mediaSourceFactory = mediaSourceFactory,
             scope = serviceScope
         )
 
         // Stream died mid-song: retry same spot with a fresh link, else skip. Never rebuild the queue.
-        recovery = PlaybackRecovery(player, serviceScope)
+        recovery = PlaybackRecovery(player, serviceScope, isOnline = ::isOnline)
         player.addListener(recovery)
+        // Quality label comes from what the player really opened, not from what a resolver claimed.
+        player.addListener(PlaybackQualityReporter(player))
 
         // Tap on the notification / lock screen player opens the app.
         val openApp = PendingIntent.getActivity(
@@ -309,35 +304,39 @@ class PlaybackService : MediaSessionService() {
                 .setAudioProcessorChain(DefaultAudioSink.DefaultAudioProcessorChain(spatial))
                 .build()
         }
-        // Buffer follows the phone's memory. A 24-bit FLAC is 3-6 Mbps (~0.5-0.75 MB/s), so 24 MB
-        // holds 30-45 s. Small phone (128 MB heap) gets 16 MB, big phone is capped at 48 MB.
-        // Time limit is the same everywhere: hold 20-60 s, resume after a stall with 8 s cushion.
+        // Time decides, not bytes. A 24-bit FLAC is 3-9 Mbps (0.4-1.1 MB/s): with a byte cap in
+        // charge, a small phone stopped loading at ~16 MB, which is only 15-40 s, below the
+        // minimum, and the song stalled. Now loading goes on until MIN_BUFFER seconds are held,
+        // whatever the bitrate (Opus needs ~0.6 MB for that, 24/96 FLAC ~25 MB). The byte target is
+        // only a ceiling for the part above the minimum, scaled to this phone's heap.
         val heapMb = (getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager).memoryClass
-        val mainBytes = (heapMb / 8).coerceIn(16, 48) * 1024 * 1024
+        val mainBytes = (heapMb / 4).coerceIn(32, 96) * 1024 * 1024
         // Helper player (crossfade) only plays the last seconds of a song: tiny buffer, so two
         // players never hold two big buffers at once.
         val loadControl = if (main) {
             DefaultLoadControl.Builder()
                 .setBufferDurationsMs(
-                    /* minBufferMs = */ 20_000,
-                    /* maxBufferMs = */ 60_000,
-                    /* bufferForPlaybackMs = */ 2_000,
-                    /* bufferForPlaybackAfterRebufferMs = */ 8_000,
+                    /* minBufferMs = */ LOAD_CONTROL_MIN_BUFFER_MS,
+                    /* maxBufferMs = */ LOAD_CONTROL_MAX_BUFFER_MS,
+                    /* bufferForPlaybackMs = */ LOAD_CONTROL_START_MS,
+                    /* bufferForPlaybackAfterRebufferMs = */ LOAD_CONTROL_REBUFFER_MS,
                 )
                 .setTargetBufferBytes(mainBytes)
-                .setPrioritizeTimeOverSizeThresholds(false)
+                .setPrioritizeTimeOverSizeThresholds(true)
                 .build()
         } else {
             DefaultLoadControl.Builder()
                 .setBufferDurationsMs(5_000, 12_000, 1_500, 3_000)
                 .setTargetBufferBytes(8 * 1024 * 1024)
-                .setPrioritizeTimeOverSizeThresholds(false)
+                .setPrioritizeTimeOverSizeThresholds(true)
                 .build()
         }
         return ExoPlayer.Builder(this, renderers)
             .apply {
                 setLoadControl(loadControl)
                 if (main) {
+                    // Gapless: open the next song's source (and start its first bytes) while this
+                    // one plays. 5 s of the next song, so the switch has audio ready.
                     // Screen off + streaming: keep CPU and Wi-Fi awake, else playback dies after a while.
                     // Needs <uses-permission android:name="android.permission.WAKE_LOCK"/> in the manifest.
                     if (checkSelfPermission(android.Manifest.permission.WAKE_LOCK) ==
@@ -349,6 +348,9 @@ class PlaybackService : MediaSessionService() {
             .setAudioAttributes(musicAttributes(com.example.chord.data.settings.AppSettings.deviceSpatial), main)
             .setHandleAudioBecomingNoisy(main)
             .build()
+            .also {
+                if (main) it.setPreloadConfiguration(ExoPlayer.PreloadConfiguration(5_000_000L))
+            }
     }
 
     private fun musicAttributes(deviceSpatial: Boolean) = androidx.media3.common.AudioAttributes.Builder()
@@ -370,35 +372,18 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun createCachingAndResolvingMediaSourceFactory(): DefaultMediaSourceFactory {
-        // Default 8 s timeouts are too short for the Monochrome proxy on a cold track.
-        val baseDataSourceFactory = DefaultHttpDataSource.Factory()
-            .setUserAgent(USER_AGENT)
-            .setConnectTimeoutMs(10_000)
-            .setReadTimeoutMs(15_000)   // dead socket: retry fast (Range resume is cheap) instead of 30 s of spinner
-            .setAllowCrossProtocolRedirects(true)
-
         com.example.chord.playback.addon.AddonStore.init(applicationContext)
         com.example.chord.playback.addon.MonochromeResolver.init(applicationContext)
-        val resolver = StreamResolver(extractor)
-
-        // 1. First, create the Resolving DataSource to handle chord:// JIT extraction
-        val resolvingDataSourceFactory = ResolvingDataSource.Factory(
-            baseDataSourceFactory,
-            resolver
-        )
-
-        // 2. Wrap it inside CacheDataSource.Factory so resolved streams get cached to disk
-        val cache = AudioCacheManager.getInstance(applicationContext)
-        val cacheDataSourceFactory = CacheDataSource.Factory()
-            .setCache(cache)
-            .setUpstreamDataSourceFactory(resolvingDataSourceFactory)
-            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
-        warmFactory = cacheDataSourceFactory
-
-        // 3. Phone files and saved songs (file:// or content://) skip the cache: route by URI scheme.
-        val local = androidx.media3.datasource.DefaultDataSource.Factory(applicationContext)
-        return DefaultMediaSourceFactory(RoutingDataSourceFactory(local, cacheDataSourceFactory))
+        // One data path for every player: resolve -> disk cache -> shared OkHttp client.
+        return PlaybackDataSources.mediaSourceFactory(applicationContext, extractor)
     }
+
+    /** Phone has a network. Unknown (no permission) counts as online, so recovery still works. */
+    private fun isOnline(): Boolean = runCatching {
+        val cm = getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork ?: return false)
+        caps?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+    }.getOrDefault(true)
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession = mediaSession
 
@@ -525,7 +510,17 @@ class PlaybackService : MediaSessionService() {
         const val ACTION_RELOAD = "com.example.chord.action.RELOAD"
         const val ACTION_SLEEP = "com.example.chord.action.SLEEP"
         const val EXTRA_MINUTES = "minutes"
-        private const val WARM_BYTES = 768L * 1024
+
+        // ===================== TUNABLES (safe to change) =====================
+        /** TUNABLE (main player): keep loading until this much audio is buffered. */
+        private const val LOAD_CONTROL_MIN_BUFFER_MS = 30_000
+        /** TUNABLE (main player): stop loading at this much audio (byte cap may stop sooner). */
+        private const val LOAD_CONTROL_MAX_BUFFER_MS = 90_000
+        /** TUNABLE (main player): audio needed before a song STARTS. Lower = faster start, more risk of a stall. */
+        private const val LOAD_CONTROL_START_MS = 5_000
+        /** TUNABLE (main player): audio needed to RESUME after a stall. */
+        private const val LOAD_CONTROL_REBUFFER_MS = 12_000
+        // ====================================================================
         const val EXTRA_NEXT = "enqueue_next"
         const val EXTRA_VIDEO_ID = "video_id"
         const val EXTRA_TITLE = "title"
@@ -540,8 +535,5 @@ class PlaybackService : MediaSessionService() {
 
         // ---> Added this extra key here <---
         const val EXTRA_THUMBNAIL_URL = "thumbnail_url"
-
-        private const val USER_AGENT =
-            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
     }
 }

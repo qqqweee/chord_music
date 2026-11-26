@@ -43,6 +43,7 @@ object AppSettings {
     private const val KEY_SPATIAL_MODE = "spatial_mode"
     private const val KEY_SPATIAL_STRENGTH = "spatial_strength"
     private const val KEY_DEVICE_SPATIAL = "device_spatial"
+    private const val KEY_LOSSLESS_STREAM = "lossless_stream"
     private const val KEY_DIAL_VIEW = "speed_dial_view"
     private const val KEY_GLASS = "glass_bars"
     private const val KEY_TRUE_GLASS = "glass_true"
@@ -89,6 +90,10 @@ object AppSettings {
     private var spatialStrengthState by mutableStateOf(60)
     /** 0..100 */
     val spatialStrength: Int get() = spatialStrengthState
+
+    /** Stream quality: true = try lossless (FLAC) first, false = always Opus. Downloads are not affected. */
+    private var losslessStreamState by mutableStateOf(true)
+    val losslessStream: Boolean get() = losslessStreamState
 
     /** Let the phone's own spatializer (Dolby Atmos where it exists) work. */
     private var deviceSpatialState by mutableStateOf(true)
@@ -175,6 +180,7 @@ object AppSettings {
         spatialModeState = SpatialMode.values().firstOrNull { it.name == p.getString(KEY_SPATIAL_MODE, null) } ?: SpatialMode.Off
         spatialStrengthState = p.getInt(KEY_SPATIAL_STRENGTH, 60)
         deviceSpatialState = p.getBoolean(KEY_DEVICE_SPATIAL, true)
+        losslessStreamState = p.getBoolean(KEY_LOSSLESS_STREAM, true)
         dialViewState = p.getString(KEY_DIAL_VIEW, "tiles") ?: "tiles"
         glassState = p.getBoolean(KEY_GLASS, true)
         trueGlassState = p.getBoolean(KEY_TRUE_GLASS, false)
@@ -231,6 +237,11 @@ object AppSettings {
         spatialStrengthState = percent
         SpatialParams.strength = percent / 100f
         prefs?.edit()?.putInt(KEY_SPATIAL_STRENGTH, percent)?.apply()
+    }
+
+    fun setLosslessStream(on: Boolean) {
+        losslessStreamState = on
+        prefs?.edit()?.putBoolean(KEY_LOSSLESS_STREAM, on)?.apply()
     }
 
     fun setDeviceSpatial(on: Boolean) {

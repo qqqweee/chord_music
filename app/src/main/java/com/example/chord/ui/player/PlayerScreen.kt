@@ -145,12 +145,12 @@ private const val HERO_HEIGHT_FRACTION = 0.50f   // artwork height as a share of
 private val HERO_MIN_HEIGHT = 240.dp
 private val HERO_MAX_HEIGHT = 500.dp
 private val CONTROLS_RESERVED = 340.dp           // room kept free for seek + buttons + bottom bar
-private val SIDE_PADDING = 26.dp
+private val SIDE_PADDING = 32.dp
 
 // Title + artist
 private val TITLE_SIZE = 21.sp
 private val ARTIST_SIZE = 18.sp
-private const val ARTIST_ALPHA = 0.65f
+private const val ARTIST_ALPHA = 0.55f
 
 // Marquee (title / artist scroll when too long)
 private const val MARQUEE_DP_PER_SEC = 28f       // scroll speed
@@ -172,7 +172,7 @@ private val LYRIC_FEATHER_WIDTH = 16.dp
 private val SWIPE_THRESHOLD = 60.dp              // how far to drag before it counts
 private const val SWIPE_DAMPING = 0.45f          // 1 = artwork sticks to the finger, lower = heavier
 private const val SWIPE_FADE = 0.45f             // how much the artwork fades at full drag (FIXED: was 055f = 55)
-private const val ARTWORK_CROSSFADE_MS = 220
+private const val ARTWORK_CROSSFADE_MS = 550
 
 // Tab motion
 private val EmphasizedDecelerate = CubicBezierEasing(0.05f, 0.7f, 0.1f, 1f)
@@ -202,6 +202,8 @@ fun PlayerScreen(
     plainLyrics: String? = null,
     /** NEW: sheet state. Drives the open / close animation. null = always fully open. */
     sheetState: PlayerSheetState? = null,
+    /** NEW: open the artist page. null = artist text and menu row do nothing. Player sheet closes after. */
+    onOpenArtist: ((String) -> Unit)? = null,
 ) {
     var selectedTab by remember { mutableIntStateOf(TAB_PLAYER) }
     var immersive by remember { mutableStateOf(false) }
@@ -223,6 +225,13 @@ fun PlayerScreen(
     }
 
     val context = LocalContext.current
+    // Go to artist page, then close the player sheet so the page is visible.
+    val openArtist: ((String) -> Unit)? = onOpenArtist?.let { go ->
+        { name: String ->
+            val clean = com.example.chord.data.history.HistoryStore.cleanArtist(name)
+            if (clean.isNotBlank()) { go(clean); onBack() }
+        }
+    }
     val audioManager = remember { context.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
     val maxVolume = remember { audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1) }
     var volume by remember { mutableFloatStateOf(audioManager.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat()) }
@@ -717,12 +726,17 @@ fun PlayerScreen(
                                                 )
                                             }
                                             Row(
-                                                Modifier.editableBlock(layout, PlayerBlock.Artist),
+                                                Modifier.editableBlock(layout, PlayerBlock.Artist)
+                                                    .then(
+                                                        if (openArtist != null && art.isNotBlank() && !editMode)
+                                                            Modifier.hapticClickable(Haptic.Tap) { openArtist(art) }
+                                                        else Modifier
+                                                    ),
                                                 verticalAlignment = Alignment.CenterVertically,
                                             ) {
                                                 MarqueeText(
                                                     text = art.ifBlank { if (buffering) "Loading audio…" else " " },
-                                                    style = TextStyle(fontSize = (18f * artistB.textScale).sp, fontWeight = FontWeight.Normal),
+                                                    style = TextStyle(fontSize = (18f * artistB.textScale).sp, fontWeight = FontWeight.Medium),
                                                     color = Color.White.copy(alpha = ARTIST_ALPHA),
                                                     modifier = Modifier.weight(1f),
                                                     startDelayMs = MARQUEE_START_DELAY_MS + if (titleScrolls) ARTIST_STAGGER_MS else 0L,
@@ -760,8 +774,8 @@ fun PlayerScreen(
                                                 onPlay = {},
                                                 showPlay = false,
                                                 onAddToPlaylist = { extras.onMore() },
-                                                onOpenArtist = null,
-                                                artist = cur.details,
+                                                onOpenArtist = openArtist,
+                                                artist = com.example.chord.data.history.HistoryStore.cleanArtist(cur.details),
                                             )
                                         }
                                 }

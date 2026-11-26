@@ -3,6 +3,8 @@ package com.example.chord.playback.addon
 import android.util.Log
 import com.example.chord.data.model.Song
 import com.example.chord.playback.AudioStream
+import com.example.chord.playback.ChordHttp
+import com.example.chord.playback.ProviderHealth
 import com.example.chord.playback.StreamInfoStore
 import org.json.JSONArray
 import org.json.JSONObject
@@ -16,21 +18,35 @@ import kotlin.math.abs
  * Native adapter for the public Monochrome track-streamer and compatible relay APIs.
  *
  * Uses the same public endpoints as Mochy's Monochrome source module:
- *   streamer: GET /search/tracks?q=...&limit=8, then GET /track/{trackId}
- *   relay:    GET /search?q=...&n=8, then GET /s/{id}?q=flac
+ *   streamer: GET /search/tracks?q=...&limit=8, then GET /track/{trackId}  (the URL is the stream)
+ *   relay:    GET /search?q=...&n=8, then GET /s/{id}?q=flac  (answers with a signed stream URL)
  *
  * Never handles Tidal credentials, shared sessions, or private account endpoints.
  */
 object MonochromeResolver {
     private const val TAG = "ChordMonochrome"
     private const val DEFAULT_SERVER = "https://tracks.monochrome.st"
-    // Short on purpose: a dead server must not hold the song for 20+ s. Next server is tried after this.
-    private const val CONNECT_TIMEOUT_MS = 6_000
-    private const val READ_TIMEOUT_MS = 12_000
-    /** Header probe only needs the first FLAC bytes. Never pull more on a slow link. */
-    private const val PROBE_BYTES = 64
+    // ===================== TUNABLES (safe to change) =====================
+    /**
+     * TUNABLE: quality asked from a STREAMER ("?quality=..."). LOSSLESS = 16-bit / 44.1 kHz FLAC,
+     * which streams fine on a phone link. Hi-res 24-bit is 2-4x bigger and is what stalls.
+     * Empty = send no parameter (server picks). NOT verified for tracks.monochrome.st: if every
+     * song falls back to Opus after this change, set it to "".
+     */
+    private const val QUALITY = ""
+    /** TUNABLE: after "song not found on Monochrome", do not search again for this long. */
     private const val MISS_TTL_MS = 30 * 60_000L
-    private const val FAILURE_TTL_MS = 10 * 60_000L
+    /** TUNABLE: after HTTP 429/503, leave the server alone this long (or what its Retry-After header says). */
+    private const val RATE_LIMIT_TTL_MS = 2 * 60_000L
+    /** TUNABLE: least time between two API calls (search, relay link) to the server. Player stream reads are not counted. */
+    private const val MIN_GAP_MS = 750L
+    /** TUNABLE: how long a RELAY stream link (signed, expires) is remembered. */
+    private const val MEMO_TTL_MS = 15 * 60_000L
+    /** TUNABLE: how long a STREAMER link is remembered. Link is /track/{id}: stable, not signed, so long is safe. */
+    private const val STREAMER_MEMO_TTL_MS = 2 * 60 * 60_000L
+    // ====================================================================
+    /** Relay answer only needs the headers. Never pull more. */
+    private const val RELAY_PEEK_BYTES = 64
     private const val MAX_RESULTS = 8
     private const val MAX_SERVERS = 8
     private const val USER_AGENT =
@@ -54,15 +70,10 @@ object MonochromeResolver {
         val isrc: String? = null,
     )
 
-    private data class Opened(val url: String, val header: ByteArray)
-
     private data class Memo(val stream: AudioStream, val at: Long)
 
     private val memo = ConcurrentHashMap<String, Memo>()
     private val misses = ConcurrentHashMap<String, Long>()
-    private val failedAt = ConcurrentHashMap<String, Long>()
-    /** Songs whose last lookup died by error (net, timeout). Not the same as "no match". */
-    private val errored = ConcurrentHashMap.newKeySet<String>()
     @Volatile private var customServers: List<Server> = emptyList()
     private val lock = Any()
 
@@ -125,6 +136,11 @@ object MonochromeResolver {
     /** One lookup per song at a time. Prefetch and player share the same work, never do it twice. */
     private val songLocks = ConcurrentHashMap<String, Any>()
 
+    /**
+     * Find the FLAC stream of a song. Streamer: the URL is returned at once, with no test request,
+     * so only the player hits the server. Relay: one small request to get the signed URL.
+     * Null = not on Monochrome (or every server failed): caller falls back.
+     */
     fun resolve(song: Song): AudioStream? {
         val songLock = songLocks.computeIfAbsent(song.videoId) { Any() }
         return synchronized(songLock) {
@@ -141,44 +157,67 @@ object MonochromeResolver {
         if (song.videoId.startsWith("local:")) return null
         val artist = com.example.chord.data.history.HistoryStore.cleanArtist(song.details)
         if (song.title.isBlank() || artist.isBlank()) return null
-        errored.remove(song.videoId)
+        val startedAt = System.currentTimeMillis()
 
-        val servers = servers().filterNot { isDown(it) }.ifEmpty { servers() }
+        // A server in its rest period is NOT asked again. All resting = play from YouTube, no request sent.
+        val servers = servers().filterNot { isDown(it) }
+        if (servers.isEmpty()) Log.w(TAG, "all servers resting, no request sent for ${song.title}")
         for (server in servers) {
             val cacheKey = "${server.baseUrl}|${song.title}|$artist"
             memo[cacheKey]?.let {
-                if (System.currentTimeMillis() - it.at < MEMO_TTL_MS) return it.stream
+                val ttl = if (server.kind == Kind.STREAMER) STREAMER_MEMO_TTL_MS else MEMO_TTL_MS
+                if (System.currentTimeMillis() - it.at < ttl) return it.stream
                 memo.remove(cacheKey, it)
             }
+            // Disk map: this song was matched before. No search needed (the slow part).
+            val saved = savedId(server, song.videoId)
             val missAt = misses[cacheKey]
-            if (missAt != null && System.currentTimeMillis() - missAt < MISS_TTL_MS) continue
+            if (saved == null && missAt != null && System.currentTimeMillis() - missAt < MISS_TTL_MS) continue
 
             try {
-                val results = search(server, "$artist ${coreTitle(song.title)}")
-                val best = rank(song, artist, results).firstOrNull()
-                if (best == null) {
-                    misses[cacheKey] = System.currentTimeMillis()
-                    continue
-                }
-                val opened = open(server, best.id) ?: throw IllegalStateException("No stream URL returned")
-                val info = parseFlacInfo(opened.header)
-                    ?: throw IllegalStateException("Server returned audio that is not FLAC")
+                val trackId = saved ?: run {
+                    val results = search(server, "$artist ${coreTitle(song.title)}")
+                    val best = rank(song, artist, results).firstOrNull()
+                    if (best == null) {
+                        misses[cacheKey] = System.currentTimeMillis()
+                        Log.i(TAG, "no match for '${song.title}' / '$artist': server gave ${results.size} results, none passed ranking")
+                    }
+                    best?.id
+                } ?: continue
 
+                val url = when (server.kind) {
+                    Kind.STREAMER -> streamerUrl(server, trackId)
+                    Kind.RELAY -> relayUrl(server, trackId)
+                        ?: run {
+                            if (saved != null) forgetSavedId(song)   // saved id went stale
+                            throw IllegalStateException("No stream URL returned")
+                        }
+                }
+                // Claimed, not proven: the label shown to the person comes from the decoder
+                // (PlaybackQualityReporter), never from this.
                 val stream = AudioStream(
-                    url = opened.url,
+                    url = url,
                     headers = mapOf("User-Agent" to USER_AGENT),
-                    quality = info.label + " · Monochrome",
+                    quality = "FLAC · Monochrome",
                     mimeType = "audio/flac",
+                    provider = providerId(server),
+                    trackKey = "$trackId|q=$QUALITY",
                 )
                 memo[cacheKey] = Memo(stream, System.currentTimeMillis())
-                StreamInfoStore.put(song.videoId, stream.quality)
-                clearDown(server)
-                Log.i(TAG, "Resolved ${song.title} from ${server.displayName}: ${info.label}")
+                if (saved == null) saveId(server, song.videoId, trackId)
+                Log.i(TAG, "Resolved ${song.title} from ${server.displayName} in ${System.currentTimeMillis() - startedAt} ms (saved id: ${saved != null})")
                 return stream
             } catch (e: Exception) {
+                // Lookup was cancelled (player stopped / song skipped). Not a server fault:
+                // do not mark the server down. Pass the cancel up.
+                if (e is InterruptedException || Thread.currentThread().isInterrupted ||
+                    e.message?.contains("interrupted", ignoreCase = true) == true
+                ) {
+                    Thread.currentThread().interrupt()
+                    throw java.io.InterruptedIOException("Monochrome lookup cancelled")
+                }
                 Log.w(TAG, "${server.displayName} failed for ${song.title}: ${e.message}")
-                errored.add(song.videoId)
-                markDown(server)
+                ProviderHealth.markFailed(providerId(server), (e as? RateLimited)?.waitMs ?: 0L)
             }
         }
         return null
@@ -186,24 +225,62 @@ object MonochromeResolver {
 
     fun isEnabled(): Boolean = true
 
-    /** True if the last lookup for this song failed by error, so a retry may work. */
-    fun failedByError(song: Song): Boolean = song.videoId in errored
+    // ---- Disk map: YouTube id -> Monochrome track id. Search once per song, ever. ----
+    private fun idPrefs() = preferenceContext?.getSharedPreferences("chord_monochrome_ids", 0)
+    private fun idKey(server: Server, videoId: String) = "${server.baseUrl}|$videoId"
+    private fun savedId(server: Server, videoId: String): String? =
+        idPrefs()?.getString(idKey(server, videoId), null)
+    private fun saveId(server: Server, videoId: String, trackId: String) {
+        idPrefs()?.edit()?.putString(idKey(server, videoId), trackId)?.apply()
+    }
+    /** Person said "wrong song / upgrade", or the server said "no such track": next lookup searches again. */
+    fun forgetSavedId(song: Song) {
+        val prefs = idPrefs() ?: return
+        val edit = prefs.edit()
+        prefs.all.keys.filter { it.endsWith("|${song.videoId}") }.forEach { edit.remove(it) }
+        edit.apply()
+    }
 
-    /**
-     * Drop saved result for this song, so next resolve asks fresh.
-     */
+    /** Drop saved result for this song, so next resolve asks fresh. */
     fun forget(song: Song) {
         val artist = com.example.chord.data.history.HistoryStore.cleanArtist(song.details)
         val tail = "|${song.title}|$artist"
-
         memo.keys.removeIf { it.endsWith(tail) }
         misses.keys.removeIf { it.endsWith(tail) }
     }
 
-    /** Changes the cache key when the configured server list changes. */
-    fun cacheSignature(): String = servers().joinToString("|") { "${it.baseUrl}:${it.kind}" }.hashCode().toUInt().toString(16)
+    private class RateLimited(val waitMs: Long) : Exception("Server rate limit, rest ${waitMs / 1000} s")
 
-    private val MEMO_TTL_MS = 15 * 60_000L
+    private var lastCallAt = 0L
+
+    /** Keep a gap between API calls, so quick skipping never turns into a burst of searches. */
+    private fun throttle() {
+        val wait = synchronized(this) {
+            val now = System.currentTimeMillis()
+            val at = maxOf(now, lastCallAt + MIN_GAP_MS)
+            lastCallAt = at
+            at - now
+        }
+        if (wait > 0) Thread.sleep(wait)   // interrupt (song skipped) is handled by the caller
+    }
+
+    /** One API call. 429/503 = the server asks us to slow down: stop asking for a while. */
+    private fun apiCall(url: String, headers: Map<String, String>, range: String? = null, maxBytes: Int = 64 * 1024): HttpResult {
+        throttle()
+        val response = request(url, headers, range, maxBytes)
+        if (response.code == 429 || response.code == 503) throw RateLimited(retryAfterMs(response.headers["retry-after"]))
+        return response
+    }
+
+    private fun retryAfterMs(header: String?): Long =
+        header?.trim()?.toLongOrNull()?.times(1000)?.coerceIn(5_000L, 10 * 60_000L) ?: RATE_LIMIT_TTL_MS
+
+    /** Player got HTTP 429 on a stream. Rest every server, so the next songs do not add to the load. */
+    fun backOff(retryAfterHeader: String?) {
+        val ms = retryAfterMs(retryAfterHeader)
+        servers().forEach { ProviderHealth.markFailed(providerId(it), ms) }
+        Log.w(TAG, "rate limited by stream, resting ${ms / 1000} s")
+    }
 
     private fun search(server: Server, query: String): List<Track> {
         val q = enc(query)
@@ -211,9 +288,8 @@ object MonochromeResolver {
             Kind.STREAMER -> "${server.baseUrl}/search/tracks?q=$q&limit=$MAX_RESULTS"
             Kind.RELAY -> "${server.baseUrl}/search?q=$q&n=$MAX_RESULTS"
         }
-        val response = request(url, searchHeaders(server.kind), range = null)
+        val response = apiCall(url, searchHeaders(server.kind))
         if (response.code !in 200..299) error("Search HTTP ${response.code}")
-        clearDown(server)
         val root = JSONObject(response.body.toString(Charsets.UTF_8))
         val rows = root.optJSONArray(if (server.kind == Kind.STREAMER) "tracks" else "data") ?: JSONArray()
         return List(rows.length()) { rows.optJSONObject(it) }
@@ -232,40 +308,27 @@ object MonochromeResolver {
             }
     }
 
-    private fun open(server: Server, id: String): Opened? {
-        return when (server.kind) {
-            Kind.STREAMER -> {
-                val url = "${server.baseUrl}/track/${encPath(id)}"
-                val head = request(url, streamHeaders, range = "bytes=0-41", maxBytes = PROBE_BYTES)
-                if (head.code !in 200..299) null else Opened(url, head.body)
-            }
-            Kind.RELAY -> {
-                val response = request("${server.baseUrl}/s/${encPath(id)}?q=flac", relayHeaders, range = "bytes=0-41", maxBytes = PROBE_BYTES)
-                if (response.code !in 200..299) return null
-                val link = response.headers.entries.firstOrNull { it.key.equals("x-relay-stream", true) }?.value
-                    ?: return null
-                val safe = validateRelayUrl(server.baseUrl, link) ?: return null
-                // The relay returns the first bytes and a signed/temporary stream URL. Playback uses that URL.
-                Opened(safe, response.body)
-            }
-        }
+    /** Streamer: /track/{id} is the stream itself. Stable, not signed. */
+    private fun streamerUrl(server: Server, id: String): String =
+        "${server.baseUrl}/track/${encPath(id)}" + if (QUALITY.isEmpty()) "" else "?quality=$QUALITY"
+
+    /** Relay: first bytes come with a signed/temporary stream URL in a header. Playback uses that URL. */
+    private fun relayUrl(server: Server, id: String): String? {
+        val response = apiCall("${server.baseUrl}/s/${encPath(id)}?q=flac", relayHeaders, range = "bytes=0-41", maxBytes = RELAY_PEEK_BYTES)
+        if (response.code !in 200..299) return null
+        val link = response.headers.entries.firstOrNull { it.key.equals("x-relay-stream", true) }?.value ?: return null
+        return validateRelayUrl(server.baseUrl, link)
     }
 
     private data class HttpResult(val code: Int, val body: ByteArray, val headers: Map<String, String>)
 
     private fun request(url: String, headers: Map<String, String>, range: String?, maxBytes: Int = 64 * 1024): HttpResult {
         require(url.startsWith("https://")) { "Only HTTPS source URLs are allowed." }
-        val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
-        try {
-            connection.connectTimeout = CONNECT_TIMEOUT_MS
-            connection.readTimeout = READ_TIMEOUT_MS
-            connection.instanceFollowRedirects = true
-            connection.requestMethod = "GET"
-            headers.forEach { (k, v) -> connection.setRequestProperty(k, v) }
-            range?.let { connection.setRequestProperty("Range", it) }
-            val code = connection.responseCode
-            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-            val body = stream?.use { input ->
+        val builder = okhttp3.Request.Builder().url(url)
+        headers.forEach { (k, v) -> builder.header(k, v) }
+        range?.let { builder.header("Range", it) }
+        ChordHttp.api.newCall(builder.build()).execute().use { resp ->
+            val body = resp.body?.source()?.inputStream()?.let { input ->
                 val out = java.io.ByteArrayOutputStream()
                 val buffer = ByteArray(8 * 1024)
                 var total = 0
@@ -277,12 +340,8 @@ object MonochromeResolver {
                 }
                 out.toByteArray()
             } ?: ByteArray(0)
-            val responseHeaders = connection.headerFields.entries
-                .filter { it.key != null && it.value?.isNotEmpty() == true }
-                .associate { it.key.lowercase(Locale.ROOT) to it.value!!.first() }
-            return HttpResult(code, body, responseHeaders)
-        } finally {
-            connection.disconnect()
+            val responseHeaders = resp.headers.names().associate { it.lowercase(Locale.ROOT) to (resp.header(it) ?: "") }
+            return HttpResult(resp.code, body, responseHeaders)
         }
     }
 
@@ -307,26 +366,6 @@ object MonochromeResolver {
 
     // Current Song model has no duration; placeholder deliberately keeps matching title/artist-driven.
     private fun songDurationMs(song: Song): Long? = null
-
-    internal fun parseFlacInfo(bytes: ByteArray): FlacInfo? {
-        if (bytes.size < 4 || bytes.copyOfRange(0, 4).decodeToString() != "fLaC") return null
-        if (bytes.size < 26) return FlacInfo(16, 44_100)
-        val b = bytes.copyOfRange(8, 26).map { it.toInt() and 0xff }
-        val rate = (b[10] shl 12) or (b[11] shl 4) or (b[12] ushr 4)
-        val bits = (((b[12] and 0x01) shl 4) or (b[13] ushr 4)) + 1
-        if (rate !in 8_000..768_000 || bits !in 8..32) return null
-        return FlacInfo(bits, rate)
-    }
-
-    internal data class FlacInfo(val bits: Int, val rate: Int) {
-        val hiRes get() = bits > 16 || rate > 48_000
-        val label: String
-            get() {
-                val khz = if (rate % 1000 == 0) "${rate / 1000}" else String.format(Locale.US, "%.1f", rate / 1000.0)
-                return "${if (hiRes) "Hi-Res FLAC" else "FLAC"} · $bits-bit / $khz kHz"
-            }
-    }
-
 
     /**
      * Mochy accepts a Monochrome website link as well as a direct server URL. Its website
@@ -403,20 +442,17 @@ object MonochromeResolver {
     private fun originOf(value: String): String = runCatching {
         val u = URI(value); "${u.scheme}://${u.rawAuthority}"
     }.getOrDefault(value)
-    private fun isDown(server: Server): Boolean =
-        failedAt[server.baseUrl]?.let { System.currentTimeMillis() - it < FAILURE_TTL_MS } == true
-    private fun markDown(server: Server) { failedAt[server.baseUrl] = System.currentTimeMillis() }
-    private fun clearDown(server: Server) { failedAt.remove(server.baseUrl) }
+    private fun providerId(server: Server) = "monochrome:${server.baseUrl}"
+    private fun isDown(server: Server): Boolean = ProviderHealth.isDown(providerId(server))
     private fun clearServerCache(base: String) {
         memo.keys.removeIf { it.startsWith("$base|") }
         misses.keys.removeIf { it.startsWith("$base|") }
-        failedAt.remove(base)
+        ProviderHealth.clear("monochrome:$base")
     }
     private fun defaultServer() = Server(DEFAULT_SERVER, Kind.STREAMER, "Monochrome", builtIn = true)
     private fun searchHeaders(kind: Kind) = if (kind == Kind.RELAY) relayHeaders else headers
     private val headers = mapOf("Accept" to "application/json", "User-Agent" to USER_AGENT)
     private val pageHeaders = mapOf("User-Agent" to USER_AGENT)
-    private val streamHeaders = mapOf("User-Agent" to USER_AGENT)
     private val relayHeaders = headers + ("X-Relay-Client" to "relay/2")
     private fun coreTitle(title: String) = title.replace(Regex("""\([^)]*\)|\[[^]]*]"""), " ").replace(Regex("""\s+"""), " ").trim()
     private fun norm(s: String) = s.lowercase(Locale.ROOT).replace(Regex("""\([^)]*\)|\[[^]]*]"""), "").replace(Regex("""[^\p{L}\p{N}]+"""), " ").trim()
@@ -434,5 +470,4 @@ object MonochromeResolver {
     }.orEmpty()
     private fun enc(s: String) = URLEncoder.encode(s, "UTF-8").replace("+", "%20")
     private fun encPath(s: String) = enc(s).replace("%2F", "%252F")
-
 }

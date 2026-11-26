@@ -362,6 +362,12 @@ class PlaybackController(context: Context) {
         if (!released) mediaController?.let(::updateProgress)
     }
 
+    /** 0..1. Used by recap stories to fade songs in and out. Ignored if the player has no volume command. */
+    fun setVolume(volume: Float) {
+        if (released) return
+        mediaController?.volume = volume.coerceIn(0f, 1f)
+    }
+
     fun seekTo(positionMs: Long) {
         if (released) return
 

@@ -22,6 +22,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -192,7 +193,9 @@ fun InfoRow(title: String, value: String) {
         Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(title, style = ChordType.CardTitle.copy(fontSize = 14.sp), color = Color.White, modifier = Modifier.weight(1f))
-        Text(value, style = ChordType.CardSub, color = Dim)
+        // Title keeps its own width. Value takes the rest and wraps. (Before, a long value took the whole
+        // row and squeezed the title to zero width, so its letters stacked.)
+        Text(title, style = ChordType.CardTitle.copy(fontSize = 14.sp), color = Color.White, modifier = Modifier.padding(end = 12.dp))
+        Text(value, style = ChordType.CardSub, color = Dim, textAlign = TextAlign.End, modifier = Modifier.weight(1f))
     }
 }

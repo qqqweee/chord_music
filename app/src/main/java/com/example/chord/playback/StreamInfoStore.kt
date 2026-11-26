@@ -25,14 +25,6 @@ object StreamInfoStore {
     val busy: StateFlow<Set<String>> = _busy.asStateFlow()
     fun setBusy(id: String, on: Boolean) { _busy.update { if (on) it + id else it - id } }
 
-    /**
-     * Songs that fell back to YouTube while an addon was on. Their stream sits in the disk cache
-     * under the addon key, so next play would reuse that worse file. Queue evicts them, addon is asked again.
-     */
-    private val degraded = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-    fun markDegraded(id: String) { degraded.add(id) }
-    fun takeDegraded(id: String): Boolean = degraded.remove(id)
-
     /** Note appended when every lossless source missed. Never counts as a codec. */
     const val NO_MATCH = "No lossless match"
 
@@ -67,30 +59,28 @@ object StreamInfoStore {
     }
 
     /**
-     * What format the cached bytes of a song really are: "flac", "aac", "opus"...
-     * The disk cache key is the chord:// link, the same for every source. If FLAC bytes were
-     * cached and a later play resolves to AAC (server hiccup), the cache would glue the FLAC head
-     * to the AAC tail. Result: song plays, no sound. This note lets the resolver catch that.
+     * The disk cache key of the stream a song last played from (provider + track + codec + size).
+     * Lets the resolver play a fully cached song with no lookup, and keep playing from disk when offline.
      */
     private var srcPrefs: android.content.SharedPreferences? = null
-    private val cacheSrc = LinkedHashMap<String, String>()
+    private val cacheKeys = LinkedHashMap<String, String>()
 
     @Synchronized
-    fun cacheSource(id: String): String? = cacheSrc[id]
+    fun lastCacheKey(id: String): String? = cacheKeys[id]
 
     @Synchronized
-    fun setCacheSource(id: String, family: String?) {
-        if (family == null) {
-            if (cacheSrc.remove(id) == null) return
+    fun setLastCacheKey(id: String, key: String?) {
+        if (key == null) {
+            if (cacheKeys.remove(id) == null) return
         } else {
-            if (cacheSrc[id] == family) return
-            cacheSrc.remove(id)
-            cacheSrc[id] = family
+            if (cacheKeys[id] == key) return
+            cacheKeys.remove(id)
+            cacheKeys[id] = key
         }
-        while (cacheSrc.size > MAX) cacheSrc.remove(cacheSrc.keys.first())
+        while (cacheKeys.size > MAX) cacheKeys.remove(cacheKeys.keys.first())
         srcPrefs?.let { p ->
             val e = p.edit().clear()
-            cacheSrc.forEach { (k, v) -> e.putString(k, v) }
+            cacheKeys.forEach { (k, v) -> e.putString(k, v) }
             e.apply()
         }
     }
@@ -116,9 +106,10 @@ object StreamInfoStore {
         forcePrefs = context.applicationContext.getSharedPreferences("stream_force_yt", Context.MODE_PRIVATE)
         _forcedYoutube.value = forcePrefs?.getStringSet("ids", emptySet())?.toSet().orEmpty()
         _labels.value = p.all.mapNotNull { (k, v) -> (v as? String)?.let { k to it } }.toMap()
-        val sp = context.applicationContext.getSharedPreferences("stream_cache_src", Context.MODE_PRIVATE)
+        // New file name: old values were codec names, not keys.
+        val sp = context.applicationContext.getSharedPreferences("stream_cache_key", Context.MODE_PRIVATE)
         srcPrefs = sp
-        sp.all.forEach { (k, v) -> (v as? String)?.let { cacheSrc[k] = it } }
+        sp.all.forEach { (k, v) -> (v as? String)?.let { cacheKeys[k] = it } }
     }
 
     @Synchronized
@@ -137,7 +128,10 @@ object StreamInfoStore {
     }
 
     /** "Opus · 160 kbps · 48 kHz". Parts we do not know are left out. */
-    fun label(codecs: String?, mime: String?, bitrate: Int?, sampleRate: Int?): String {
+    fun label(
+        codecs: String?, mime: String?, bitrate: Int?, sampleRate: Int?,
+        bitDepth: Int? = null, channels: Int? = null,
+    ): String {
         val c = (codecs ?: mime).orEmpty().lowercase(Locale.ROOT)
         val codec = when {
             "opus" in c -> "Opus"
@@ -152,6 +146,13 @@ object StreamInfoStore {
             val v = it / 1000.0
             String.format(Locale.US, "%.1f", v) + " kHz"
         }
-        return listOfNotNull(codec, khz, kbps, if (codec != null) "Stereo" else null).joinToString(" · ")
+        val depth = bitDepth?.takeIf { it > 0 }?.let { "$it-bit" }
+        val layout = when {
+            codec == null -> null
+            channels == null || channels == 2 -> "Stereo"
+            channels == 1 -> "Mono"
+            else -> "$channels ch"
+        }
+        return listOfNotNull(codec, depth, khz, kbps, layout).joinToString(" · ")
     }
 }

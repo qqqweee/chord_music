@@ -1,5 +1,6 @@
 package com.example.chord.playback.addon
 
+import com.example.chord.playback.ChordHttp
 import java.io.IOException
 
 /** Plain HTTP GET helper used by addon manifest, search and stream requests. */
@@ -28,53 +29,44 @@ internal object AddonHttp {
     }
 
     private fun once(url: String, headers: Map<String, String>, timeoutMs: Int): String {
-        val connection = java.net.URL(url).openConnection()
-                as java.net.HttpURLConnection
+        // Shared pool and DNS (ChordHttp). Only the timeouts are this call's own.
+        val client = ChordHttp.base.newBuilder()
+            .connectTimeout(timeoutMs.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
+            .readTimeout(timeoutMs.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
+            .build()
+        val builder = okhttp3.Request.Builder().url(url)
+            .header("Accept", "application/json")
+            .header("User-Agent", "Mozilla/5.0 (Android) Chord")
 
-        try {
-            connection.connectTimeout = timeoutMs
-            connection.readTimeout = timeoutMs
-            connection.setRequestProperty("Accept", "application/json")
-            connection.setRequestProperty(
-                "User-Agent",
-                "Mozilla/5.0 (Android) Chord"
+        // https://user:pass@host/... : OkHttp does not send this by itself.
+        java.net.URL(url).userInfo?.takeIf { it.isNotBlank() }?.let {
+            val token = android.util.Base64.encodeToString(
+                java.net.URLDecoder.decode(it, "UTF-8").toByteArray(), android.util.Base64.NO_WRAP
             )
-            connection.instanceFollowRedirects = true
+            builder.header("Authorization", "Basic $token")
+        }
+        // Addon's own headers (API key, token). Set last so they win.
+        headers.forEach { (k, v) -> builder.header(k, v) }
 
-            // https://user:pass@host/... : Java does not send this by itself.
-            java.net.URL(url).userInfo?.takeIf { it.isNotBlank() }?.let {
-                val token = android.util.Base64.encodeToString(
-                    java.net.URLDecoder.decode(it, "UTF-8").toByteArray(), android.util.Base64.NO_WRAP
-                )
-                connection.setRequestProperty("Authorization", "Basic $token")
-            }
-            // Addon's own headers (API key, token). Set last so they win.
-            headers.forEach { (k, v) -> connection.setRequestProperty(k, v) }
-
-            val code = connection.responseCode
-            if (code !in 200..299) {
+        client.newCall(builder.build()).execute().use { resp ->
+            if (!resp.isSuccessful) {
                 // Body usually says why (bad key, expired token). Goes to Logcat.
-                val why = runCatching {
-                    connection.errorStream?.bufferedReader()?.use { it.readText() }?.take(200)
-                }.getOrNull().orEmpty().replace('\n', ' ')
-                android.util.Log.w("ChordAddon", "HTTP $code from ${url.substringBefore('?')} : $why")
-                throw IllegalStateException("HTTP $code")
+                val why = runCatching { resp.peekBody(200).string() }.getOrDefault("").replace('\n', ' ')
+                android.util.Log.w("ChordAddon", "HTTP ${resp.code} from ${url.substringBefore('?')} : $why")
+                throw IllegalStateException("HTTP ${resp.code}")
             }
-
             // Cap the body: a broken or hostile addon must not fill memory.
-            return connection.inputStream.use { input ->
-                val out = java.io.ByteArrayOutputStream()
-                val buf = ByteArray(16 * 1024)
-                while (true) {
-                    val n = input.read(buf)
-                    if (n < 0) break
-                    out.write(buf, 0, n)
-                    if (out.size() > MAX_BODY_BYTES) throw IOException("Addon response too large")
-                }
-                out.toString(Charsets.UTF_8.name())
+            val source = resp.body?.source() ?: return ""
+            val out = java.io.ByteArrayOutputStream()
+            val buf = ByteArray(16 * 1024)
+            val input = source.inputStream()
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                out.write(buf, 0, n)
+                if (out.size() > MAX_BODY_BYTES) throw IOException("Addon response too large")
             }
-        } finally {
-            connection.disconnect()
+            return out.toString(Charsets.UTF_8.name())
         }
     }
 
