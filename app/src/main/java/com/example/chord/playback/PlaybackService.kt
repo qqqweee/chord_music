@@ -137,6 +137,7 @@ class PlaybackService : MediaSessionService() {
                 // Upgrade must beat every remembered choice: chosen source, YouTube link,
                 // Monochrome "no match" / old link.
                 StreamResolver.forget(cur.videoId)
+                com.example.chord.playback.addon.MonochromeResolver.clearRest()
                 com.example.chord.playback.addon.MonochromeResolver.forget(cur)
                 com.example.chord.playback.addon.MonochromeResolver.forgetSavedId(cur)
                 AddonResolver.forgetMemo(cur)
@@ -150,6 +151,20 @@ class PlaybackService : MediaSessionService() {
                     uri.getQueryParameter("a").orEmpty(),
                 )
                 AddonResolver.evictDisk(applicationContext, cur)
+                val outcome = if (StreamResolver.hadNoLosslessMatch(cur.videoId)) {
+                    val why = com.example.chord.playback.addon.MonochromeResolver.lastMissReason(cur.videoId)
+                    "No lossless match" + (why?.let { " ($it)" } ?: "")
+                } else if (StreamResolver.currentStream(cur.videoId)?.let { com.example.chord.playback.addon.AddonResolver.isLossless(it.mimeType) || com.example.chord.playback.addon.AddonResolver.isLossless(it.quality) } == true) {
+                    "Lossless found"
+                } else null
+                // Paused song: the decoder may not report for a while, so the label would stay stale.
+                // Write what the new link claims now; PlaybackQualityReporter corrects it from the real decoder.
+                StreamResolver.currentStream(cur.videoId)?.let { st ->
+                    StreamInfoStore.put(cur.videoId, st.quality)
+                }
+                if (outcome != null) android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    android.widget.Toast.makeText(applicationContext, outcome, android.widget.Toast.LENGTH_LONG).show()
+                }
                 // Upgrade asked: drop every cached copy of this song (any provider). Keys are per
                 // provider, so nothing could glue, but the old copy would be picked up again.
                 AudioCacheManager.evict(cur.videoId)

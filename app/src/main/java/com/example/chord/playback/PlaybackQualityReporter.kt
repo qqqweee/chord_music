@@ -61,8 +61,8 @@ class PlaybackQualityReporter(private val player: Player) : Player.Listener {
                 format.sampleRate.takeIf { it > 0 }, bits, format.channelCount.takeIf { it > 0 },
             )
         }
-        val note = if (StreamResolver.hadNoLosslessMatch(videoId)) StreamInfoStore.NO_MATCH else ""
-        StreamInfoStore.put(videoId, listOf(label, note).filter { it.isNotBlank() }.joinToString(" · "))
+        // Label = codec only ("Opus · 160 kbps ..."). The "no lossless match" reason is shown in the toast, not here.
+        StreamInfoStore.put(videoId, label)
         stream?.provider?.takeIf { it.isNotBlank() }?.let { ProviderHealth.markOk(it) }
     }
 }

@@ -48,6 +48,8 @@ object MonochromeResolver {
     /** Relay answer only needs the headers. Never pull more. */
     private const val RELAY_PEEK_BYTES = 64
     private const val MAX_RESULTS = 8
+    /** Search JSON of 8 full Tidal-style rows can pass 64 KB; a cut body fails to parse and rests the server. */
+    private const val SEARCH_MAX_BYTES = 1024 * 1024
     private const val MAX_SERVERS = 8
     private const val USER_AGENT =
         "Mozilla/5.0 (Android) Chord/1.0 (compatible; audio source)"
@@ -74,6 +76,12 @@ object MonochromeResolver {
 
     private val memo = ConcurrentHashMap<String, Memo>()
     private val misses = ConcurrentHashMap<String, Long>()
+    /** Why the last lookup of a song found nothing ("rate limited", "no result passed matching"...). Shown next to "No lossless match". */
+    private val missReasons = ConcurrentHashMap<String, String>()
+    fun lastMissReason(videoId: String): String? = missReasons[videoId]
+
+    /** Upgrade asked: forget every "server resting" mark, so the person's tap is never ignored. */
+    fun clearRest() = servers().forEach { ProviderHealth.clear(providerId(it)) }
     @Volatile private var customServers: List<Server> = emptyList()
     private val lock = Any()
 
@@ -160,8 +168,12 @@ object MonochromeResolver {
         val startedAt = System.currentTimeMillis()
 
         // A server in its rest period is NOT asked again. All resting = play from YouTube, no request sent.
+        missReasons.remove(song.videoId)
         val servers = servers().filterNot { isDown(it) }
-        if (servers.isEmpty()) Log.w(TAG, "all servers resting, no request sent for ${song.title}")
+        if (servers.isEmpty()) {
+            missReasons[song.videoId] = "server resting after an error"
+            Log.w(TAG, "all servers resting, no request sent for ${song.title}")
+        }
         for (server in servers) {
             val cacheKey = "${server.baseUrl}|${song.title}|$artist"
             memo[cacheKey]?.let {
@@ -172,14 +184,26 @@ object MonochromeResolver {
             // Disk map: this song was matched before. No search needed (the slow part).
             val saved = savedId(server, song.videoId)
             val missAt = misses[cacheKey]
-            if (saved == null && missAt != null && System.currentTimeMillis() - missAt < MISS_TTL_MS) continue
+            if (saved == null && missAt != null && System.currentTimeMillis() - missAt < MISS_TTL_MS) {
+                missReasons[song.videoId] = "not found on ${server.displayName}"
+                continue
+            }
 
             try {
                 val trackId = saved ?: run {
-                    val results = search(server, "$artist ${coreTitle(song.title)}")
-                    val best = rank(song, artist, results).firstOrNull()
+                    // Bilingual titles ("プロポーズ - Propose") are listed under ONE of the names on Tidal.
+                    // Try each name, then the full title, until a result passes matching.
+                    var results: List<Track> = emptyList()
+                    var best: Track? = null
+                    for (q in searchQueries(song.title, artist)) {
+                        results = search(server, q)
+                        best = rank(song, artist, results).firstOrNull()
+                        if (best != null) break
+                    }
                     if (best == null) {
                         misses[cacheKey] = System.currentTimeMillis()
+                        missReasons[song.videoId] =
+                            if (results.isEmpty()) "server returned no results" else "${results.size} results, none matched"
                         Log.i(TAG, "no match for '${song.title}' / '$artist': server gave ${results.size} results, none passed ranking")
                     }
                     best?.id
@@ -217,6 +241,10 @@ object MonochromeResolver {
                     throw java.io.InterruptedIOException("Monochrome lookup cancelled")
                 }
                 Log.w(TAG, "${server.displayName} failed for ${song.title}: ${e.message}")
+                missReasons[song.videoId] = when {
+                    e is RateLimited -> "server busy (rate limit)"
+                    else -> "server error: ${e.message?.take(60)}"
+                }
                 ProviderHealth.markFailed(providerId(server), (e as? RateLimited)?.waitMs ?: 0L)
             }
         }
@@ -288,9 +316,12 @@ object MonochromeResolver {
             Kind.STREAMER -> "${server.baseUrl}/search/tracks?q=$q&limit=$MAX_RESULTS"
             Kind.RELAY -> "${server.baseUrl}/search?q=$q&n=$MAX_RESULTS"
         }
-        val response = apiCall(url, searchHeaders(server.kind))
+        val response = apiCall(url, searchHeaders(server.kind), maxBytes = SEARCH_MAX_BYTES)
         if (response.code !in 200..299) error("Search HTTP ${response.code}")
-        val root = JSONObject(response.body.toString(Charsets.UTF_8))
+        val text = response.body.toString(Charsets.UTF_8)
+        // HTML ("Loading...", Cloudflare page) with HTTP 200 is a dead server, not "no results".
+        if (!text.trimStart().startsWith("{")) error("Search answered with a non-JSON page")
+        val root = JSONObject(text)
         val rows = root.optJSONArray(if (server.kind == Kind.STREAMER) "tracks" else "data") ?: JSONArray()
         return List(rows.length()) { rows.optJSONObject(it) }
             .filterNotNull()
@@ -299,13 +330,27 @@ object MonochromeResolver {
                 val id = first(o, "trackId", "id")
                 val title = first(o, "title")
                 if (id.isBlank() || title.isBlank()) return@mapNotNull null
-                val artists = o.optJSONArray("artistNames")
-                val artist = if (artists != null) {
-                    (0 until artists.length()).joinToString(", ") { artists.optString(it) }
-                } else first(o, "artist").replace(Regex("""(?<! )&(?! )"""), ", ")
+                val artist = artistOf(o)
                 val duration = o.optLong("duration", 0L).takeIf { it > 0 }?.let { if (it > 10_000) it else it * 1000 }
                 Track(id, title, artist, first(o, "albumTitle", "releaseTitle", "album").ifBlank { null }, duration, first(o, "isrc").ifBlank { null })
             }
+    }
+
+    /** Artist names from any of the shapes servers use: artistNames [..], artists [{name}|".."], artist {name}|"..". */
+    private fun artistOf(o: JSONObject): String {
+        fun names(arr: JSONArray) = (0 until arr.length()).mapNotNull { i ->
+            val v = arr.opt(i)
+            when (v) {
+                is JSONObject -> v.optString("name").ifBlank { null }
+                null, JSONObject.NULL -> null
+                else -> v.toString().ifBlank { null }
+            }
+        }
+        for (key in listOf("artistNames", "artists")) {
+            o.optJSONArray(key)?.let { arr -> names(arr).takeIf { it.isNotEmpty() }?.let { return it.joinToString(", ") } }
+        }
+        o.optJSONObject("artist")?.optString("name")?.takeIf { it.isNotBlank() }?.let { return it }
+        return first(o, "artist", "artistName", "performer").replace(Regex("""(?<! )&(?! )"""), ", ")
     }
 
     /** Streamer: /track/{id} is the stream itself. Stable, not signed. */
@@ -346,14 +391,23 @@ object MonochromeResolver {
     }
 
     private fun rank(song: Song, artist: String, tracks: List<Track>): List<Track> {
-        val wantedTitle = norm(song.title)
+        val wantedForms = titleForms(song.title)
         val wantedArtist = words(artist).toSet()
         return tracks.mapNotNull { candidate ->
-            val candidateTitle = norm(candidate.title)
+            val candidateForms = titleForms(candidate.title)
             val candidateArtist = words(candidate.artist).toSet()
-            val title = similarity(wantedTitle, candidateTitle)
-            val artistOverlap = if (wantedArtist.isEmpty()) 0f else
-                wantedArtist.intersect(candidateArtist).size.toFloat() / wantedArtist.size
+            // Best match over every name of both titles ("A - B" counts as A, B and "A B").
+            val title = wantedForms.maxOf { w -> candidateForms.maxOf { c -> similarity(w, c) } }
+            // Candidate with no artist info: judge by title (and album) only, instead of rejecting everything.
+            val artistOverlap = when {
+                wantedArtist.isEmpty() -> 0f
+                candidateArtist.isEmpty() -> 0.5f
+                // Artist name inside the other's text also counts ("A R Rahman" vs "AR Rahman" style splits).
+                else -> maxOf(
+                    wantedArtist.intersect(candidateArtist).size.toFloat() / wantedArtist.size,
+                    if (norm(candidate.artist).replace(" ", "").contains(norm(artist).replace(" ", "")) && norm(artist).isNotBlank()) 1f else 0f,
+                )
+            }
             val duration = if (candidate.durationMs == null) 0.6f else {
                 val expected = songDurationMs(song)
                 if (expected == null) 0.6f else (1f - abs(expected - candidate.durationMs).toFloat() / 20_000f).coerceIn(0f, 1f)
@@ -455,6 +509,29 @@ object MonochromeResolver {
     private val pageHeaders = mapOf("User-Agent" to USER_AGENT)
     private val relayHeaders = headers + ("X-Relay-Client" to "relay/2")
     private fun coreTitle(title: String) = title.replace(Regex("""\([^)]*\)|\[[^]]*]"""), " ").replace(Regex("""\s+"""), " ").trim()
+    /**
+     * Every name a title can go by, normalised: the whole title, each side of " - " / " / " / " | ",
+     * and the text inside brackets. "プロポーズ - Propose" -> [プロポーズ propose, プロポーズ, propose].
+     */
+    private fun titleForms(title: String): List<String> {
+        val base = stripSuffix(title)
+        val parts = base.split(Regex("""\s[-–—/|]\s"""))
+        val inner = Regex("""[(\[]([^)\]]+)[)\]]""").findAll(base).map { it.groupValues[1] }.toList()
+        return (listOf(base) + parts + inner).map { norm(it) }.filter { it.isNotBlank() }.distinct()
+            .ifEmpty { listOf(norm(title)) }
+    }
+
+    /** Search texts, best first: artist + each name of the title, then artist + the whole title. Max 3. */
+    private fun searchQueries(title: String, artist: String): List<String> {
+        val base = stripSuffix(title)
+        val parts = base.split(Regex("""\s[-–—/|]\s""")).map { coreTitle(it) }.filter { it.isNotBlank() }
+        return (parts + coreTitle(base)).distinct().map { "$artist $it".trim() }.take(3)
+    }
+
+    /** "Kesariya - From "Brahmastra"", "Song (feat. X)", "Song - Remastered 2011" -> "Kesariya" etc. Variants (live, remix) are kept for the penalty. */
+    private fun stripSuffix(t: String): String =
+        t.replace(Regex("""\s[-–—]\s(from|remaster|remastered|\d{4}|feat|ft\.?|with)\b.*""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\s(feat|ft)\.?\s.*""", RegexOption.IGNORE_CASE), "")
     private fun norm(s: String) = s.lowercase(Locale.ROOT).replace(Regex("""\([^)]*\)|\[[^]]*]"""), "").replace(Regex("""[^\p{L}\p{N}]+"""), " ").trim()
     private fun words(s: String) = norm(s).split(' ').filter { it.length > 1 && it !in setOf("the", "and") }
     private fun similarity(a: String, b: String): Float {

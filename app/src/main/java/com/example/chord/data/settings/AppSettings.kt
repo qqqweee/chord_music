@@ -14,11 +14,10 @@ import com.example.chord.ui.haptics.HapticSettings
 import com.example.chord.ui.theme.ChordTheme
 import com.example.chord.ui.theme.ThemeMode
 
-/** What the user wants when saving a song. Opus = small. Lossless = FLAC. HiRes = FLAC above CD (24-bit / over 48 kHz). */
+/** What the user wants when saving a song. Opus = small. Lossless = FLAC. */
 enum class DownloadQuality(val label: String, val hint: String) {
     Opus("Opus", "Small files. YouTube Opus, about 160 kbps."),
-    Lossless("Lossless", "FLAC, CD quality or better. Falls back to Opus if none found."),
-    HiRes("Hi-Res", "Best FLAC, 24-bit / over 48 kHz when it exists. Falls back to lossless, then Opus."),
+    Lossless("Lossless", "FLAC. Falls back to Opus if none found."),
 }
 
 /**
@@ -68,8 +67,8 @@ object AppSettings {
     private var downloadTreeState by mutableStateOf<String?>(null)
     val downloadTree: String? get() = downloadTreeState
 
-    /** Quality for new downloads. Default Hi-Res = best that exists (same as before). */
-    private var downloadQualityState by mutableStateOf(DownloadQuality.HiRes)
+    /** Quality for new downloads. Default Lossless. */
+    private var downloadQualityState by mutableStateOf(DownloadQuality.Lossless)
     val downloadQuality: DownloadQuality get() = downloadQualityState
 
     /** On = every download tap asks which quality. Off = always use [downloadQuality]. */
@@ -173,7 +172,7 @@ object AppSettings {
         ChordTheme.coverTint = p.getBoolean(KEY_COVER_TINT, false)
         HapticSettings.enabled = p.getBoolean(KEY_HAPTICS, true)
         downloadTreeState = p.getString(KEY_DL_TREE, null)
-        downloadQualityState = DownloadQuality.values().firstOrNull { it.name == p.getString(KEY_DL_QUALITY, null) } ?: DownloadQuality.HiRes
+        downloadQualityState = DownloadQuality.values().firstOrNull { it.name == p.getString(KEY_DL_QUALITY, null) } ?: DownloadQuality.Lossless   // old saved "HiRes" lands here too
         askQualityState = p.getBoolean(KEY_DL_ASK, false)
         crossfadeState = p.getInt(KEY_CROSSFADE, 0)
         queueSizeState = p.getInt(KEY_QUEUE, 20).coerceIn(10, 40)

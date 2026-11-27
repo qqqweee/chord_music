@@ -39,6 +39,11 @@ object StreamInfoStore {
         return com.example.chord.playback.addon.AddonResolver.isLossless(codec)
     }
 
+    /** Drops the old "No lossless match (...)" note from a label. Labels saved by older versions still carry it. */
+    private fun stripNote(label: String): String =
+        label.split(" · ").filter { "no lossless match" !in it.lowercase(Locale.ROOT) && "no match" !in it.lowercase(Locale.ROOT) }
+            .joinToString(" · ")
+
     /** Label parts without the fallback note. */
     fun cleanParts(label: String?): List<String> =
         label.orEmpty().split(" · ").map { it.trim() }
@@ -105,7 +110,7 @@ object StreamInfoStore {
         prefs = p
         forcePrefs = context.applicationContext.getSharedPreferences("stream_force_yt", Context.MODE_PRIVATE)
         _forcedYoutube.value = forcePrefs?.getStringSet("ids", emptySet())?.toSet().orEmpty()
-        _labels.value = p.all.mapNotNull { (k, v) -> (v as? String)?.let { k to it } }.toMap()
+        _labels.value = p.all.mapNotNull { (k, v) -> (v as? String)?.let { k to stripNote(it) } }.toMap()
         // New file name: old values were codec names, not keys.
         val sp = context.applicationContext.getSharedPreferences("stream_cache_key", Context.MODE_PRIVATE)
         srcPrefs = sp
@@ -113,7 +118,8 @@ object StreamInfoStore {
     }
 
     @Synchronized
-    fun put(videoId: String, label: String) {
+    fun put(videoId: String, rawLabel: String) {
+        val label = stripNote(rawLabel)
         if (label.isBlank() || _labels.value[videoId] == label) return
         val next = LinkedHashMap(_labels.value)
         next.remove(videoId)

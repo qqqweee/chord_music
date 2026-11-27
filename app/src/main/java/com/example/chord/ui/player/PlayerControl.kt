@@ -1,4 +1,3 @@
-
 package com.example.chord.ui.player
 
 import androidx.compose.animation.animateColorAsState
@@ -33,9 +32,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.FormatListBulleted
 import androidx.compose.material.icons.rounded.Pause
-import androidx.compose.material.icons.rounded.Person
+import androidx.compose.material.icons.rounded.Repeat
+import androidx.compose.material.icons.rounded.RepeatOne
+import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.PlayArrow
-import androidx.compose.material.icons.rounded.Smartphone
 import androidx.compose.material.icons.rounded.VolumeDown
 import androidx.compose.material.icons.rounded.VolumeUp
 import androidx.compose.material3.CircularProgressIndicator
@@ -483,8 +483,10 @@ fun PlayerBottomBar(
     selectedTab: Int,
     onLyrics: () -> Unit,
     onQueue: () -> Unit,
-    onOutput: () -> Unit,
-    onProfile: () -> Unit = {},
+    shuffle: Boolean,
+    repeat: com.example.chord.ui.player.RepeatMode,
+    onShuffle: () -> Unit,
+    onRepeat: () -> Unit,
     modifier: Modifier = Modifier,
     /** Each part is its own editable block: pass its editableBlock modifier + size. */
     lyricsModifier: Modifier = Modifier,
@@ -531,13 +533,14 @@ fun PlayerBottomBar(
                 Modifier
                     .width(60.dp * pillScale)
                     .height(40.dp * pillScale)
-                    .hapticClickable(Haptic.Tap, onClick = onOutput),
+                    .hapticClickable(if (shuffle) Haptic.ToggleOff else Haptic.ToggleOn, onClick = onShuffle),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
-                    Icons.Rounded.Smartphone,
-                    "Audio output",
-                    tint = accent.copy(alpha = 0.88f),
+                    Icons.Rounded.Shuffle,
+                    if (shuffle) "Shuffle on" else "Shuffle off",
+                    // On = bright accent, off = dim. Repeat below follows the same rule.
+                    tint = if (shuffle) accent.copy(alpha = 1f) else Color.White.copy(alpha = 0.45f),
                     modifier = Modifier.size(20.dp * pillScale)
                 )
             }
@@ -553,13 +556,13 @@ fun PlayerBottomBar(
                 Modifier
                     .width(60.dp * pillScale)
                     .height(40.dp * pillScale)
-                    .hapticClickable(Haptic.Tap, onClick = onProfile),
+                    .hapticClickable(if (repeat != com.example.chord.ui.player.RepeatMode.Off) Haptic.ToggleOff else Haptic.ToggleOn, onClick = onRepeat),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
-                    Icons.Rounded.Person,
-                    "Profile",
-                    tint = accent.copy(alpha = 0.88f),
+                    if (repeat == com.example.chord.ui.player.RepeatMode.One) Icons.Rounded.RepeatOne else Icons.Rounded.Repeat,
+                    when (repeat) { com.example.chord.ui.player.RepeatMode.Off -> "Repeat off"; com.example.chord.ui.player.RepeatMode.All -> "Repeat all"; com.example.chord.ui.player.RepeatMode.One -> "Repeat one" },
+                    tint = if (repeat != com.example.chord.ui.player.RepeatMode.Off) accent.copy(alpha = 1f) else Color.White.copy(alpha = 0.45f),
                     modifier = Modifier.size(20.dp * pillScale)
                 )
             }

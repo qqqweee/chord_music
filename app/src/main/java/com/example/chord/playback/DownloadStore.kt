@@ -415,39 +415,41 @@ object DownloadStore {
         val stream = withContext(Dispatchers.IO) {
             val artist = HistoryStore.cleanArtist(song.details)
             val addonOn = AddonStore.enabled().any { it.downloads }
-            val monoOn = MonochromeResolver.isEnabled()
-
-            fun hiRes(s: AudioStream?) = s != null &&
-                    listOf("hi-res", "hires", "24-bit", "24 bit").any { it in s.quality.lowercase() }
 
             var lossless: AudioStream? = null
             if (want != DownloadQuality.Opus) {
-                if (monoOn) {
-                    repeat(2) { attempt ->
-                        if (lossless == null && id !in cancelled) {
-                            lossless = runCatching { MonochromeResolver.resolve(song) }.getOrNull()
-                            if (lossless == null && attempt == 0) delay(1_200)
+                // Playing this song as FLAC right now: that exact link is proven, use it.
+                lossless = StreamResolver.currentStream(id)?.takeIf {
+                    AddonResolver.isLossless(it.mimeType) || AddonResolver.isLossless(it.quality)
+                }
+                if (lossless == null) {
+                    // Download never trusts an old "not found" or a resting server: ask clean,
+                    // three times, with a growing pause (public server rate-limits bursts).
+                    MonochromeResolver.clearRest()
+                    MonochromeResolver.forget(song)
+                    for (attempt in 0 until 3) {
+                        if (lossless != null || id in cancelled) break
+                        lossless = runCatching { MonochromeResolver.resolve(song) }.getOrNull()
+                        if (lossless == null && attempt < 2) {
+                            delay(1_500L * (attempt + 1))
+                            MonochromeResolver.clearRest()
+                            MonochromeResolver.forget(song)
                         }
                     }
                 }
-                if ((lossless == null || (want == DownloadQuality.HiRes && !hiRes(lossless))) && addonOn) {
-                    var fromAddon: AudioStream? = null
-                    repeat(2) { attempt ->
-                        if (fromAddon == null && id !in cancelled) {
-                            fromAddon = AddonResolver.resolve(id, song.title, artist, true)
-                            if (fromAddon == null && attempt == 0) delay(1_200)
-                        }
+                if (lossless == null && addonOn) {
+                    for (attempt in 0 until 2) {
+                        if (lossless != null || id in cancelled) break
+                        lossless = AddonResolver.resolve(id, song.title, artist, true)
+                        if (lossless == null && attempt == 0) delay(1_200)
                     }
-                    if (lossless == null || hiRes(fromAddon)) lossless = fromAddon ?: lossless
                 }
             }
 
             val chosen = lossless ?: AudioStreamExtractor(app).extract(id)
-            when {
-                lossless == null && want != DownloadQuality.Opus ->
-                    toast("No lossless match for ${song.title}. Saved Opus.")
-                lossless != null && want == DownloadQuality.HiRes && !hiRes(lossless) ->
-                    toast("No Hi-Res for ${song.title}. Saved lossless.")
+            if (lossless == null && want != DownloadQuality.Opus) {
+                val why = MonochromeResolver.lastMissReason(id)
+                toast("No lossless match for ${song.title}" + (why?.let { " ($it)" } ?: "") + ". Saved Opus.")
             }
             chosen
         }

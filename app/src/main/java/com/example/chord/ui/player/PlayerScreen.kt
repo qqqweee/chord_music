@@ -7,12 +7,9 @@ import android.media.AudioManager
 import android.os.Build
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
@@ -22,10 +19,8 @@ import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -34,7 +29,6 @@ import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.draggable
 import androidx.compose.foundation.gestures.rememberDraggableState
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -56,8 +50,6 @@ import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
-import androidx.compose.material.icons.rounded.MoreHoriz
 import androidx.compose.material.icons.rounded.Star
 import androidx.compose.material.icons.rounded.StarBorder
 import androidx.compose.material3.Icon
@@ -95,6 +87,9 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.animation.core.animateIntAsState
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalDensity
@@ -404,6 +399,22 @@ fun PlayerScreen(
             minOf(maxHeight * HERO_HEIGHT_FRACTION, maxHeight - CONTROLS_RESERVED)
                 .coerceIn(HERO_MIN_HEIGHT, HERO_MAX_HEIGHT)
         }
+        // ── Even section spacing ────────────────────────────────────────────
+        // Sections: [title+artist] [lyric line + seek] [play controls] [volume] [bottom bar].
+        // Free room under the hero is cut into equal gaps between them, so a long phone has no
+        // hole under the hero. Short phone: no free room, gap = 0, same as before.
+        // Heights are measured WITHOUT the gaps, so adding gaps never changes the result.
+        var mainH by remember { mutableIntStateOf(0) }
+        var titleH by remember { mutableIntStateOf(0) }
+        var lyricH by remember { mutableIntStateOf(0) }
+        var ctrlNatural by remember { mutableIntStateOf(0) }
+        val heroPx = with(density) { heroHeight.roundToPx() }
+        val gapTarget = if (mainH > 0 && titleH > 0 && ctrlNatural > 0) {
+            val slots = if (lyricH > 0) 5 else 4      // hero>title, title>lyric, seek>play, play>volume, volume>bar
+            ((mainH - heroPx - titleH - lyricH - ctrlNatural) / slots).coerceAtLeast(0)
+        } else 0
+        val gapPx by animateIntAsState(gapTarget, tween(240), label = "sectionGap")
+        val gapDp = with(density) { gapPx.toDp() }
         val artBlock = layout.state(PlayerBlock.Artwork)
         val heroCornerDp = layout.heroCorner.dp
         val bottomFade = layout.heroBottomFade
@@ -656,6 +667,7 @@ fun PlayerScreen(
                 .sheetStage(sheetState, 0.2f, 1f, risePx = with(density) { 56.dp.toPx() })
                 .hazeSource(editHaze)
                 .navigationBarsPadding()
+                .onSizeChanged { mainH = it.height }
         ) {
 
             Box(
@@ -678,11 +690,15 @@ fun PlayerScreen(
                     },
                 ) { tab ->
                     when (tab) {
-                        TAB_PLAYER -> Column(Modifier.fillMaxSize()) {
+                        // Custom layout (not a Column): on a long phone the hero stays at its height and the
+                        // spare room is shared EVENLY above the title, between title and lyric line, and
+                        // above the seek bar. On a short phone there is no spare room, so it behaves as before
+                        // (title sits at the bottom and may overlap the artwork edge).
+                        TAB_PLAYER -> Layout(modifier = Modifier.fillMaxSize(), content = {
 
                             // Empty space over the artwork. It is the swipe surface for track changes.
                             Box(
-                                Modifier.weight(1f).fillMaxWidth()
+                                Modifier.fillMaxWidth()
                                     .then(if (editMode) Modifier else skipSwipe.then(enterEdit))
                             )
 
@@ -693,7 +709,7 @@ fun PlayerScreen(
                             val favB = layout.state(PlayerBlock.Favorite)
                             val moreB = layout.state(PlayerBlock.More)
                             Row(
-                                Modifier.fillMaxWidth().padding(horizontal = SIDE_PADDING),
+                                Modifier.fillMaxWidth().onSizeChanged { titleH = it.height }.padding(horizontal = SIDE_PADDING),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Column(Modifier.weight(1f)) {
@@ -783,8 +799,6 @@ fun PlayerScreen(
 
                             val lyricsB = layout.state(PlayerBlock.Lyrics)
                             if (lyricsB.visible || editMode) {
-                                Spacer(Modifier.height(14.dp))
-
                                 // The current lyric: one line, right above the seek bar.
                                 LyricStrip(
                                     rawLyrics = syncedLyrics,
@@ -793,9 +807,32 @@ fun PlayerScreen(
                                     isPlaying = playbackState.isPlaying,
                                     onOpen = { selectedTab = TAB_LYRICS },
                                     textScale = lyricsB.textScale,
-                                    modifier = Modifier.padding(horizontal = SIDE_PADDING)
+                                    modifier = Modifier.onSizeChanged { lyricH = it.height }.padding(top = 14.dp).padding(horizontal = SIDE_PADDING)
                                         .editableBlock(layout, PlayerBlock.Lyrics),
                                 )
+                            } else {
+                                SideEffect { lyricH = 0 }   // hidden: it must not count as a section
+                            }
+                        }) { measurables, constraints ->
+                            val w = constraints.maxWidth
+                            val h = constraints.maxHeight
+                            val loose = Constraints(minWidth = w, maxWidth = w, minHeight = 0, maxHeight = Constraints.Infinity)
+                            val title = measurables[1].measure(loose)
+                            val lyric = measurables.getOrNull(2)?.measure(loose)
+                            val used = title.height + (lyric?.height ?: 0)
+                            val heroPx = heroHeight.roundToPx()
+                            val slack = h - heroPx - used
+                            val slots = if (lyric != null) 3 else 2      // gaps: above title, (title-lyric), below
+                            // gapPx (equal gap shared with the controls below) once measured;
+                            // until then fall back to sharing this area's own slack.
+                            val gap = if (gapPx > 0) gapPx else if (slack > 0) slack / slots else 0
+                            val titleY = if (slack > 0 || gapPx > 0) heroPx + gap else (h - used).coerceAtLeast(0)
+                            val swipe = measurables[0].measure(Constraints.fixed(w, titleY))
+                            this.layout(w, h) {
+                                swipe.place(0, 0)
+                                title.place(0, titleY)
+                                // Lyric line sits right above the seek bar (flush with the area bottom).
+                                lyric?.place(0, if (gapPx > 0) h - lyric.height else titleY + title.height + gap)
                             }
                         }
 
@@ -837,7 +874,11 @@ fun PlayerScreen(
                 exit = fadeOut(tween(110)),
             ) {
                 Box(
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 15.dp),
+                    modifier = Modifier.fillMaxWidth()
+                        // Natural height = measured height minus the 3 gaps added below. Queue tab swaps the
+                        // bottom bar for a different one, so it does not update the number.
+                        .onSizeChanged { if (selectedTab != TAB_QUEUE) ctrlNatural = it.height - 3 * gapPx }
+                        .padding(bottom = 15.dp),
                     contentAlignment = Alignment.BottomCenter
                 ) {
                     Column(Modifier.fillMaxWidth()) {
@@ -857,6 +898,7 @@ fun PlayerScreen(
                                 thickness = seekB.iconScale,
                             )
                         }
+                        Spacer(Modifier.height(gapDp))   // seek > play controls
                         // Previous / play / next are three blocks, not one.
                         // Hidden buttons keep their room (collapse = false) so the
                         // other two do not jump sideways.
@@ -874,6 +916,7 @@ fun PlayerScreen(
                             playScale = playB.iconScale,
                             nextScale = nextB.iconScale,
                         )
+                        Spacer(Modifier.height(gapDp))   // play controls > volume
                         // Volume is a sibling block: the whole row (icons + slider) moves together.
                         val volB = layout.state(PlayerBlock.Volume)
                         Column(
@@ -889,7 +932,7 @@ fun PlayerScreen(
                                 iconScale = volB.iconScale,
                             )
                         }
-                        Spacer(Modifier.height(1.dp))
+                        Spacer(Modifier.height(1.dp + gapDp))   // volume > bottom bar
                         val lyrBtnB = layout.state(PlayerBlock.LyricsBtn)
                         val pillB = layout.state(PlayerBlock.OutputPill)
                         val queueBtnB = layout.state(PlayerBlock.QueueBtn)
@@ -906,7 +949,10 @@ fun PlayerScreen(
                                 selectedTab = selectedTab,
                                 onLyrics = { selectedTab = if (selectedTab == TAB_LYRICS) TAB_PLAYER else TAB_LYRICS },
                                 onQueue = { selectedTab = if (selectedTab == TAB_QUEUE) TAB_PLAYER else TAB_QUEUE },
-                                onOutput = { openAudioOutput(context) },
+                                shuffle = extras.shuffle,
+                                repeat = extras.repeat,
+                                onShuffle = extras.onToggleShuffle,
+                                onRepeat = extras.onCycleRepeat,
                                 lyricsModifier = Modifier.editableBlock(layout, PlayerBlock.LyricsBtn, collapse = false),
                                 pillModifier = Modifier.editableBlock(layout, PlayerBlock.OutputPill, collapse = false),
                                 queueModifier = Modifier.editableBlock(layout, PlayerBlock.QueueBtn, collapse = false),
@@ -925,6 +971,8 @@ fun PlayerScreen(
                             Box(
                                 modifier = Modifier
                                     .editableBlock(layout, PlayerBlock.DeviceName)
+                                    // Tap the device name to pick the audio output (the old phone icon did this).
+                                    .hapticClickable(Haptic.Tap) { if (!editMode) openAudioOutput(context) }
                                     .padding(bottom = 1.dp),
                                 contentAlignment = Alignment.Center,
                             ) {
