@@ -60,7 +60,7 @@ sealed interface UpdatePhase {
 object AppUpdater {
     // TODO set to the GitHub repo that hosts the Chord releases.
     private const val OWNER = "qqqweee"
-    private const val REPO = "chord"
+    private const val REPO = "chord_music"
 
     private const val FILE = "chord_update"
     private const val KEY_SEEN = "seen_version"
